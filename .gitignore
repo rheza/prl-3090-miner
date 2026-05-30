@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# CUDA / C++ build
+cuda/build/
+*.o
+*.obj
+*.so
+*.pyd
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# local secrets / runtime
+miner.toml
+*.local.toml
+/tmp/pearlgw.sock
+
+# NOTE: tests/golden/*.npz and manifest.json ARE committed — they are the
+# correctness oracle for the CUDA backend. Do not ignore them.

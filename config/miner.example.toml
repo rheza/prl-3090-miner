@@ -1,0 +1,59 @@
+# PRL-3090 miner configuration (PRD §11.2).
+#
+# This file NEVER contains a seed phrase or private key. `mining_address` is the
+# PUBLIC Taproot (P2TR bech32m) address produced by Oyster `getnewaddress`.
+#
+# Field -> official mapping (see docs/protocol-notes.md §3.3, §6):
+#   node.rpc_url/user/password  -> pearld JSON-RPC (consumed by pearl-gateway as
+#                                  PEARLD_RPC_URL / PEARLD_RPC_USER / PEARLD_RPC_PASSWORD)
+#   wallet.mining_address        -> PEARLD_MINING_ADDRESS (must be P2TR bech32m, witness v1)
+#   gateway.transport/socket/port-> MINER_RPC_TRANSPORT / MINER_RPC_SOCKET_PATH / MINER_RPC_PORT
+
+[mode]
+# solo-local | solo-pool | benchmark | simnet
+type = "simnet"
+
+[wallet]
+mining_address = "prl1p..."          # PUBLIC address only. Never a key.
+
+[node]
+# pearld RPC. Ports: mainnet 44107, testnet 44109, testnet2 44111, simnet 18556.
+rpc_url = "https://127.0.0.1:44107"
+rpc_user = "rpcuser"
+rpc_password_env = "PEARLD_RPC_PASSWORD"   # read from env, never stored here
+
+[gateway]
+# How prl3090-miner reaches the local pearl-gateway miner RPC.
+transport = "uds"                    # "uds" | "tcp"
+socket_path = "/tmp/pearlgw.sock"    # used when transport = "uds"
+host = "127.0.0.1"                   # used when transport = "tcp"
+port = 8337                          # used when transport = "tcp"
+poll_interval_ms = 1000              # match gateway refresh cadence (PEARLD_REFRESH_INTERVAL_SECONDS)
+
+[gpu]
+devices = [0]
+backend = "cuda-sm86"                # "cuda-sm86" (GPU) | "cpu" (reference, for validation)
+power_limit_watts = 320              # applied ONLY if apply_overclock = true
+target_core_clock_mhz = 1500
+target_memory_clock_mhz = 9500
+max_temp_c = 78
+max_vram_temp_c = 96
+apply_overclock = false              # safety: no clock/power change unless explicitly true (PRD §17, §23)
+
+[performance]
+batch_size = "auto"
+streams = 2
+job_prefetch = true
+stale_cancel = true                  # abandon GPU work the instant the header changes (§3.4)
+sync_submit = false
+
+[logging]
+level = "info"                       # debug | info | warn | error
+format = "text"                      # text | json
+status_interval_sec = 30
+
+[safety]
+# Stop/throttle behaviour (PRD §17).
+throttle_on_overtemp = true
+exit_after_invalid_proofs = 10       # bail out of an invalid-proof loop
+warn_on_world_readable_config = true

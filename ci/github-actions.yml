@@ -1,0 +1,27 @@
+# CI for the runnable (CPU) parts of PRL-3090. Copy to .github/workflows/ci.yml.
+# The CUDA backend is built/tested separately on a self-hosted Ampere runner
+# (not covered here) — see docs/cuda-sm86-port.md.
+name: prl-3090 reference + orchestration
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Generate golden vectors
+        run: python reference/generate_golden.py
+      - name: Reference tests (incl. official truth table + golden replay)
+        run: pytest -q reference/
+      - name: Orchestration tests (mine->submit loop, stale-cancel, safety)
+        run: pytest -q miner/
+      - name: CLI smoke (self-test against in-process gateway)
+        run: python -m miner self-test

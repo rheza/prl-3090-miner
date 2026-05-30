@@ -1,0 +1,5 @@
+# Runtime deps for the reference + orchestration layer (no torch, no CUDA).
+numpy>=1.26
+blake3>=1.0.7
+# Dev
+pytest>=8
