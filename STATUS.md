@@ -20,10 +20,10 @@ environment.**
 | 0 | Research & baseline | ✅ done | Official repo present & mapped; RTX 3090 confirmed. AlphaMiner benchmark not run (no engagement). |
 | 1 | Protocol understanding | ✅ done | [`docs/protocol-notes.md`](docs/protocol-notes.md) — full job→proof→submit map with `file:line` citations + source index. |
 | 2 | CPU reference + golden vectors | ✅ done | [`reference/pearl_reference.py`](reference/pearl_reference.py); `pytest -q reference/` = **27 passed** incl. the official `test_noisy_gemm` truth table; 6 golden vectors in [`tests/golden/`](tests/golden/). Cross-check vs official torch: [`reference/verify_against_official.py`](reference/verify_against_official.py) (run in WSL). |
-| 3 | CUDA build skeleton | 🟧 scaffolding | [`cuda/`](cuda/) has CMake (`sm_86`), device manager, NVML monitor, kernel decls, golden-loading test harness. **Compiles in WSL once CUDA Toolkit is installed; not yet built here (no nvcc on Windows).** |
-| 4 | CUDA correctness | ⬜ not started | The real work: port 4 Hopper kernels to Ampere `mma.sync` (see [`docs/cuda-sm86-port.md`](docs/cuda-sm86-port.md)). Validated against `tests/golden/`. |
-| 5 | SimNet miner loop | 🟧 partial | Orchestration loop (job fetch → backend → submit → stale-cancel → metrics) implemented in [`miner/`](miner/) and self-tested with the **CPU backend** against a mock gateway. Needs a live SimNet node + the CUDA backend for the real loop. |
-| 6 | Performance optimization | ⬜ not started | Depends on M4. Plan + tooling in [`docs/cuda-sm86-port.md`](docs/cuda-sm86-port.md) §6–7. |
+| 3 | CUDA build skeleton | ✅ done | Built + ran in **WSL2 Ubuntu 24.04 on the RTX 3090** (CUDA 12.9, `sm_86`). `cuda-naive` backend reports available; device + NVML telemetry work. |
+| 4 | CUDA correctness | ✅ done (naive) | [`cuda/src/naive_sm86.cu`](cuda/src/naive_sm86.cu) — a correct (plain-integer-core) GPU NoisyGEMM + on-device keyed-BLAKE3. **Passes all 6 golden vectors on the GPU** (`C`, `found`, winning indices, the 16 transcript words) + 256 BLAKE3 vectors (`reference/run_cuda_golden.py`). The *tensor-core* kernels for speed are M6's prerequisite, not correctness. |
+| 5 | SimNet miner loop | 🟧 partial | Orchestration loop (job fetch → backend → submit → stale-cancel → metrics) runs through the **real GPU** via `cuda-naive` (`miner benchmark --backend cuda-naive`) and self-tests vs a mock gateway. Needs a live SimNet node for the full chain loop. |
+| 6 | Performance optimization | ⬜ not started | **This is the remaining hard work**: port the Hopper kernels to Ampere `mma.sync` tensor cores (the naive path is ~2.9 GMAC/s — see below). Plan + tooling in [`docs/cuda-sm86-port.md`](docs/cuda-sm86-port.md) §3, §6–7. |
 | 7 | Mainnet true-solo beta | ⬜ not started | Depends on M4–M6. |
 | 8 | Close-to-the-bone RC | ⬜ not started | Depends on M4–M6. |
 
@@ -31,17 +31,21 @@ environment.**
 - The full **PoUW algorithm** as a CPU reference, bit-faithful to the official torch implementation,
   with the **denoise identity `C == A·B`** holding on every golden case.
 - **Golden-vector generation + replay**, the correctness oracle for the GPU port.
-- The **miner CLI / orchestration** (`list-devices`, `self-test`, `benchmark`, `run`) with a CPU backend
-  and a mock gateway, exercising job management, stale cancellation, metrics, and safety throttling.
+- A **correct CUDA NoisyGEMM running on the RTX 3090** (`cuda-naive`), validated bit-for-bit against the
+  golden vectors + a from-scratch on-device keyed-BLAKE3 — the miner *runs on the GPU*.
+- The **miner CLI / orchestration** (`list-devices`, `self-test`, `benchmark`, `run`) driving either the
+  CPU or the GPU (`cuda-naive`) backend, exercising job management, stale cancellation, metrics, safety.
 
-## The one hard thing that remains
-Porting the **Hopper `sm_90a` CUTLASS kernels** (main GEMM, NoisingA/B, tensor-hash leaf) to **Ampere
-`sm_86` `mma.sync`**. The audit (`docs/cuda-sm86-port.md`) shows this is *tractable and bit-exact-able*
-(no fp8 — int8/fp16 paths are native on Ampere) but is a **multi-week CUDA effort**, and its #1 risk is
-the accumulator fragment-layout re-derivation (a silent-correctness hazard, gated by the golden
-transcript words). The first V1 release will be **much slower than AlphaMiner** and that is expected and
-acceptable — correctness before speed (PRD §12.3–12.4).
+## The one hard thing that remains — SPEED (not correctness)
+Correctness on GPU is **done**. What remains is performance: replacing the naive integer-core kernels
+with **Ampere `sm_86` `mma.sync` tensor-core kernels** (porting the Hopper `sm_90a` CUTLASS design). The
+audit (`docs/cuda-sm86-port.md`) shows this is *tractable and bit-exact-able* (no fp8 — int8/fp16 are
+native on Ampere) but is a **multi-week CUDA effort**; its #1 risk is the accumulator fragment-layout
+re-derivation (a silent-correctness hazard, now gated by the golden transcript words the naive backend
+already validates).
 
-## Performance targets (PRD §12.4) — none achieved yet; correctness gates them
-Minimum 20 TH/s · Beta 50 TH/s · Competitive 80 TH/s · Close-to-the-bone 100–110 TH/s. Current measured
-GPU hashrate: **0** (no GPU kernel built). Do not report a number until M4 passes golden.
+## Performance targets (PRD §12.4) — correctness done; speed is the open work
+Minimum 20 TH/s · Beta 50 TH/s · Competitive 80 TH/s · Close-to-the-bone 100–110 TH/s. The naive
+(correct, non-tensor-core) backend measures **~2.9 GMAC/s** on the production shape — ~4–5 orders of
+magnitude below the AlphaMiner class. That gap is the whole point of the tensor-core port; do not report
+a protocol TH/s number until the `mma.sync` kernels land and pass golden against a live node.

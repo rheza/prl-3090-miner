@@ -37,7 +37,7 @@ def cmd_list_devices(_args) -> int:
         print(f"  [{g['index']}] {g['name']}  {g['memory_total_mib']} MiB  "
               f"driver {g['driver']}  temp {g.get('temp_c','-')}C  power {g.get('power_w','-')}W")
     # backend availability
-    for name in ("cpu", "cuda-sm86"):
+    for name in ("cpu", "cuda-naive", "cuda-sm86"):
         try:
             make_backend(name)
             print(f"  backend '{name}': available")
@@ -169,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pb = sub.add_parser("benchmark", help="measure backend throughput")
     pb.add_argument("--duration", type=float, default=30.0)
-    pb.add_argument("--backend", default="cpu", choices=["cpu", "cuda-sm86"])
+    pb.add_argument("--backend", default="cpu", choices=["cpu", "cuda-naive", "cuda-sm86"])
     pb.add_argument("--device", type=int, default=0)
     pb.set_defaults(func=cmd_benchmark)
 
