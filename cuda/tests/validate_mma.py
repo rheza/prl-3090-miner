@@ -32,6 +32,11 @@ def main() -> int:
     lib.prl_mma_gemm_bench.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                        ctypes.POINTER(ctypes.c_double)]
     lib.prl_mma_gemm_bench.restype = ctypes.c_int
+    lib.prl_mma_gemm_smem.argtypes = [i8p, i8p, i32p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.prl_mma_gemm_smem.restype = ctypes.c_int
+    lib.prl_mma_gemm_smem_bench.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_double)]
+    lib.prl_mma_gemm_smem_bench.restype = ctypes.c_int
     print(f"CUDA devices: {lib.prl_mma_device_count()}")
 
     ok = True
@@ -46,21 +51,28 @@ def main() -> int:
         if rc != 0:
             print(f"  {case['name']}: rc={rc} {lib.prl_mma_last_error().decode()}"); ok = False; continue
         match = np.array_equal(C, d["C"])
-        ok = ok and match
-        print(f"  [{'PASS' if match else 'FAIL'}] {case['name']:26s} mma C == golden C (=A@B)")
+        Cs = np.zeros((m, n), dtype=np.int32)
+        rcs = lib.prl_mma_gemm_smem(A.ctypes.data_as(i8p), B.ctypes.data_as(i8p),
+                                    Cs.ctypes.data_as(i32p), m, k, n)
+        match_s = (rcs == 0 and np.array_equal(Cs, d["C"]))
+        ok = ok and match and match_s
+        print(f"  [{'PASS' if match else 'FAIL'}/{'PASS' if match_s else 'FAIL'}] "
+              f"{case['name']:26s} simple/smem C == golden C (=A@B)")
 
-    print("THROUGHPUT (kernel-only, this UNOPTIMIZED one-warp-per-tile kernel):")
+    print("THROUGHPUT (kernel-only):  simple = one warp/tile (no reuse);  smem = 64x64 tiled")
     for (m, k, n) in [(128, 256, 256), (512, 512, 512), (1024, 1024, 1024)]:
-        ms = ctypes.c_double(0)
-        rc = lib.prl_mma_gemm_bench(m, k, n, 50, ctypes.byref(ms))
-        if rc != 0:
-            print(f"  bench {m}x{k}x{n}: {lib.prl_mma_last_error().decode()}"); continue
         macs = m * k * n
-        gmacs = macs / (ms.value / 1e3) / 1e9
-        print(f"  {m:5d}x{k:5d}x{n:5d}: {ms.value:.3f} ms  {gmacs:8.1f} GMAC/s  "
-              f"({2*gmacs/1e3:.2f} TOPS)")
-    print("  NOTE: no shared-mem tiling / cp.async yet (re-reads global per tile). The")
-    print("        smem-tiled + cp.async pipeline is the next step (docs/cuda-sm86-port.md §3,§6).")
+        out = {}
+        for label, fn in (("simple", lib.prl_mma_gemm_bench), ("smem", lib.prl_mma_gemm_smem_bench)):
+            ms = ctypes.c_double(0)
+            if fn(m, k, n, 50, ctypes.byref(ms)) == 0:
+                out[label] = macs / (ms.value / 1e3) / 1e9
+        s = out.get("simple", 0); sm = out.get("smem", 0)
+        speedup = (sm / s) if s else 0
+        print(f"  {m:5d}x{k:5d}x{n:5d}:  simple {s:8.1f} GMAC/s ({2*s/1e3:5.2f} TOPS)   "
+              f"smem {sm:8.1f} GMAC/s ({2*sm/1e3:6.2f} TOPS)   {speedup:.1f}x")
+    print("  NOTE: smem adds data reuse but still no cp.async double-buffering; that + transcript")
+    print("        fusion are the next steps (docs/cuda-sm86-port.md §3,§6).")
     print("RESULT:", "ALL PASS" if ok else "FAILURES")
     return 0 if ok else 1
 
