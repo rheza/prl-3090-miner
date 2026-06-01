@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
 
 // ---------- device BLAKE3 (single 64-byte keyed block) ----------
@@ -152,6 +153,58 @@ __global__ void k_pow_scan(const uint32_t* transcripts,const uint32_t* key,const
     }
 }
 
+// ---------- GPU noise generation (faithful to noise_generation.py) ----------
+// Removes the per-attempt Python BLAKE3 noise loop (the 68% bottleneck) by deriving
+// E_AL/E_AR/E_BL/E_BR on-device from the 32-byte keys, exactly as NoiseGenerator does.
+__device__ __forceinline__ uint32_t mulhi_u32(uint32_t a, uint32_t b) {
+    return (uint32_t)(((uint64_t)a * b) >> 32);
+}
+// Dense uniform int8 in [-32,31]: byte&63 - 32 (noise_generation.py:107-135). prepend slot 0.
+__global__ void k_ng_dense(const uint32_t* key, const uint32_t* seed, int total, int8_t* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // draw index
+    if (i * 32 >= total) return;
+    uint32_t m[16];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) m[j] = 0;
+    m[0] = (uint32_t)(1 + i);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) m[8 + j] = seed[j];
+    uint32_t dig[8]; blake3_keyed_block(m, key, dig);
+    #pragma unroll
+    for (int b = 0; b < 32; b++) {
+        int idx = i * 32 + b;
+        if (idx < total) { uint8_t by = (dig[b >> 2] >> ((b & 3) * 8)) & 0xFF; out[idx] = (int8_t)((by & 63) - 32); }
+    }
+}
+// Signed-permutation: each line one +1 and one -1 (noise_generation.py:137-187). prepend slot 1.
+__global__ void k_ng_perm(const uint32_t* key, const uint32_t* seed, int required, int assign_cols,
+                          int r, int other, int8_t* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // draw index (8 lines per draw)
+    if (i * 8 >= required) return;
+    uint32_t m[16];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) m[j] = 0;
+    m[1] = (uint32_t)(1 + i);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) m[8 + j] = seed[j];
+    uint32_t dig[8]; blake3_keyed_block(m, key, dig);
+    #pragma unroll
+    for (int kk = 0; kk < 8; kk++) {
+        int ai = i * 8 + kk;
+        if (ai >= required) break;
+        uint32_t u = dig[kk];
+        int first = u & (r - 1);
+        int second = first ^ (int)(1u + mulhi_u32((uint32_t)(r - 1), u));
+        if (assign_cols) { out[first * other + ai] = 1; out[second * other + ai] = -1; }   // r x other
+        else { out[ai * r + first] = 1; out[ai * r + second] = -1; }                        // other x r
+    }
+}
+__global__ void k_transpose(const int8_t* U, int8_t* T, int rows, int cols) {  // U[rows][cols] -> T[cols][rows]
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    T[(idx % cols) * rows + (idx / cols)] = U[idx];
+}
+
 // ---------- host C ABI ----------
 static char g_err[256]={0};
 #define CK(call) do{ cudaError_t e_=(call); if(e_!=cudaSuccess){ \
@@ -211,13 +264,43 @@ int prl_mine_bench(int m,int k,int n,int iters,double* out_ms){
     cudaEventDestroy(s);cudaEventDestroy(e); cudaFree(dAn);cudaFree(dBn);cudaFree(dTr); return 0;
 }
 
+// Generate the four noise matrices on-GPU from the two 32-byte keys (validation entry).
+int prl_noisegen(const uint8_t* keyA, const uint8_t* keyB, int m, int k, int n,
+                 int8_t* EAL, int8_t* EAR, int8_t* EBL, int8_t* EBR) {
+    const int r = 128;
+    uint32_t hsa[8] = {0}, hsb[8] = {0};
+    { unsigned char s[32] = {'A','_','t','e','n','s','o','r'}; memcpy(hsa, s, 32); }
+    { unsigned char s[32] = {'B','_','t','e','n','s','o','r'}; memcpy(hsb, s, 32); }
+    uint32_t *dKA,*dKB,*dSA,*dSB; int8_t *dEAL,*dEAR,*dEBL,*dEBR,*dU;
+    CK(cudaMalloc(&dKA,32)); CK(cudaMalloc(&dKB,32)); CK(cudaMalloc(&dSA,32)); CK(cudaMalloc(&dSB,32));
+    CK(cudaMalloc(&dEAL,(size_t)m*r)); CK(cudaMalloc(&dEAR,(size_t)r*k));
+    CK(cudaMalloc(&dEBL,(size_t)k*r)); CK(cudaMalloc(&dEBR,(size_t)r*n)); CK(cudaMalloc(&dU,(size_t)n*r));
+    CK(cudaMemcpy(dKA,keyA,32,cudaMemcpyHostToDevice)); CK(cudaMemcpy(dKB,keyB,32,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dSA,hsa,32,cudaMemcpyHostToDevice)); CK(cudaMemcpy(dSB,hsb,32,cudaMemcpyHostToDevice));
+    CK(cudaMemset(dEAR,0,(size_t)r*k)); CK(cudaMemset(dEBL,0,(size_t)k*r));
+    int dA=((m*r+31)/32), dU2=((n*r+31)/32), pk=((k+7)/8), T=256;
+    k_ng_dense<<<(dA+T-1)/T,T>>>(dKA,dSA,m*r,dEAL);
+    k_ng_perm<<<(pk+T-1)/T,T>>>(dKA,dSA,k,1,r,k,dEAR);
+    k_ng_perm<<<(pk+T-1)/T,T>>>(dKB,dSB,k,0,r,k,dEBL);
+    k_ng_dense<<<(dU2+T-1)/T,T>>>(dKB,dSB,n*r,dU);
+    k_transpose<<<((size_t)n*r+T-1)/T,T>>>(dU,dEBR,n,r);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(EAL,dEAL,(size_t)m*r,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(EAR,dEAR,(size_t)r*k,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(EBL,dEBL,(size_t)k*r,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(EBR,dEBR,(size_t)r*n,cudaMemcpyDeviceToHost));
+    cudaFree(dKA);cudaFree(dKB);cudaFree(dSA);cudaFree(dSB);
+    cudaFree(dEAL);cudaFree(dEAR);cudaFree(dEBL);cudaFree(dEBR);cudaFree(dU);
+    return 0;
+}
+
 // ---- Persistent context: malloc device buffers + a stream ONCE, reuse per attempt ----
 // This removes the per-attempt cudaMalloc/cudaFree that caps the orchestrator loop (the
 // kernel itself is ~38 TOPS). All work runs on the context's stream with async copies.
 typedef struct PrlMineCtx {
     int m, k, n; size_t ST;
-    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn;
-    uint32_t *dTr,*dKey,*dTgt,*dTrOut; int *dF,*dAR,*dBC;
+    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn,*dU;
+    uint32_t *dTr,*dKey,*dKeyB,*dTgt,*dTrOut,*dSA,*dSB; int *dF,*dAR,*dBC;
     cudaStream_t stream;
 } PrlMineCtx;
 
@@ -233,8 +316,16 @@ void* prl_mine_ctx_create(int m, int k, int n) {
         && cudaMalloc(&c->dTr,c->ST*64)==cudaSuccess && cudaMalloc(&c->dKey,32)==cudaSuccess
         && cudaMalloc(&c->dTgt,32)==cudaSuccess && cudaMalloc(&c->dTrOut,64)==cudaSuccess
         && cudaMalloc(&c->dF,4)==cudaSuccess && cudaMalloc(&c->dAR,4)==cudaSuccess
-        && cudaMalloc(&c->dBC,4)==cudaSuccess && cudaStreamCreate(&c->stream)==cudaSuccess;
+        && cudaMalloc(&c->dBC,4)==cudaSuccess
+        && cudaMalloc(&c->dKeyB,32)==cudaSuccess && cudaMalloc(&c->dSA,32)==cudaSuccess
+        && cudaMalloc(&c->dSB,32)==cudaSuccess && cudaMalloc(&c->dU,(size_t)n*r)==cudaSuccess
+        && cudaStreamCreate(&c->stream)==cudaSuccess;
     if (!ok) { snprintf(g_err,sizeof(g_err),"ctx_create: alloc failed"); return nullptr; }
+    uint32_t hsa[8]={0}, hsb[8]={0};
+    { unsigned char s[32]={'A','_','t','e','n','s','o','r'}; memcpy(hsa,s,32); }
+    { unsigned char s[32]={'B','_','t','e','n','s','o','r'}; memcpy(hsb,s,32); }
+    cudaMemcpy(c->dSA,hsa,32,cudaMemcpyHostToDevice);
+    cudaMemcpy(c->dSB,hsb,32,cudaMemcpyHostToDevice);
     return c;
 }
 
@@ -268,11 +359,47 @@ int prl_mine_ctx_run(void* h, const int8_t* A, const int8_t* B, const int8_t* EA
     return 0;
 }
 
+// Keyed run: generate noise ON-GPU from the two keys (no Python BLAKE3), then mine.
+int prl_mine_ctx_run_keyed(void* h, const int8_t* A, const int8_t* B,
+                           const uint8_t* keyA32, const uint8_t* keyB32, const uint8_t* target32,
+                           int* found, int* a_row, int* b_col, uint32_t* tr_out) {
+    PrlMineCtx* c=(PrlMineCtx*)h; if(!c) return 2;
+    int m=c->m, k=c->k, n=c->n; const int r=128; cudaStream_t s=c->stream; int T=256;
+    cudaMemcpyAsync(c->dA,A,(size_t)m*k,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dB,B,(size_t)k*n,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dKey,keyA32,32,cudaMemcpyHostToDevice,s);   // key_A doubles as the PoW key
+    cudaMemcpyAsync(c->dKeyB,keyB32,32,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dTgt,target32,32,cudaMemcpyHostToDevice,s);
+    cudaMemsetAsync(c->dTr,0,c->ST*64,s);
+    cudaMemsetAsync(c->dEAR,0,(size_t)r*k,s);
+    cudaMemsetAsync(c->dEBL,0,(size_t)k*r,s);
+    // GPU noise generation from keys (replaces the Python BLAKE3 loop — the 68% bottleneck)
+    k_ng_dense<<<((((m*r+31)/32))+T-1)/T,T,0,s>>>(c->dKey,c->dSA,m*r,c->dEAL);
+    k_ng_perm<<<((((k+7)/8))+T-1)/T,T,0,s>>>(c->dKey,c->dSA,k,1,r,k,c->dEAR);
+    k_ng_perm<<<((((k+7)/8))+T-1)/T,T,0,s>>>(c->dKeyB,c->dSB,k,0,r,k,c->dEBL);
+    k_ng_dense<<<((((n*r+31)/32))+T-1)/T,T,0,s>>>(c->dKeyB,c->dSB,n*r,c->dU);
+    k_transpose<<<(((size_t)n*r)+T-1)/T,T,0,s>>>(c->dU,c->dEBR,n,r);
+    k_noiseA<<<(((size_t)m*k)+T-1)/T,T,0,s>>>(c->dA,c->dEAL,c->dEAR,c->dAn,m,k,r);
+    k_noiseB<<<(((size_t)k*n)+T-1)/T,T,0,s>>>(c->dB,c->dEBL,c->dEBR,c->dBn,k,n,r);
+    dim3 grid(m/128,n/128);
+    k_mine<<<grid,256,0,s>>>(c->dAn,c->dBn,c->dTr,m,k,n);
+    k_pow_scan<<<1,1,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dF,c->dAR,c->dBC,c->dTrOut);
+    cudaMemcpyAsync(found,c->dF,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(a_row,c->dAR,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(b_col,c->dBC,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(tr_out,c->dTrOut,64,cudaMemcpyDeviceToHost,s);
+    cudaStreamSynchronize(s);
+    cudaError_t e=cudaGetLastError();
+    if (e!=cudaSuccess){ snprintf(g_err,sizeof(g_err),"ctx_run_keyed: %s",cudaGetErrorString(e)); return 4; }
+    return 0;
+}
+
 void prl_mine_ctx_destroy(void* h) {
     PrlMineCtx* c = (PrlMineCtx*)h; if (!c) return;
     cudaFree(c->dA); cudaFree(c->dB); cudaFree(c->dEAL); cudaFree(c->dEAR);
-    cudaFree(c->dEBL); cudaFree(c->dEBR); cudaFree(c->dAn); cudaFree(c->dBn);
-    cudaFree(c->dTr); cudaFree(c->dKey); cudaFree(c->dTgt); cudaFree(c->dTrOut);
+    cudaFree(c->dEBL); cudaFree(c->dEBR); cudaFree(c->dAn); cudaFree(c->dBn); cudaFree(c->dU);
+    cudaFree(c->dTr); cudaFree(c->dKey); cudaFree(c->dKeyB); cudaFree(c->dTgt); cudaFree(c->dTrOut);
+    cudaFree(c->dSA); cudaFree(c->dSB);
     cudaFree(c->dF); cudaFree(c->dAR); cudaFree(c->dBC); cudaStreamDestroy(c->stream); free(c);
 }
 } // extern "C"

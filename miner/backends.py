@@ -165,9 +165,8 @@ class CudaMineBackend:
         B = rng.integers(-64, 64, size=(self.K, self.N), dtype=np.int8)
         key_A = blake3(hdr + b"A").digest()
         key_B = blake3(hdr + b"B").digest()
-        E_AL, E_AR, E_BL, E_BR = self._noise.generate(key_A, key_B, self.M, self.K, self.N)
-        found, a_row, b_col, tr = self._cuda.run(A, B, E_AL, E_AR, E_BL, E_BR,
-                                                 pow_key=key_A, pow_target=job.target)
+        # noise is generated ON-GPU from the keys (no Python BLAKE3 loop — the old 68% bottleneck)
+        found, a_row, b_col, tr = self._cuda.run_keyed(A, B, key_A, key_B, job.target)
         work = self.M * self.K * self.N
         if not found:
             return BackendResult(False, None, work, {"attempt": attempt})

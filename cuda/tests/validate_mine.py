@@ -42,6 +42,8 @@ def main() -> int:
     lib.prl_mine_ctx_run.argtypes = [ctypes.c_void_p, i8p, i8p, i8p, i8p, i8p, i8p,
                                      u8p, u8p, ip, ip, ip, u32p]
     lib.prl_mine_ctx_run.restype = ctypes.c_int
+    lib.prl_mine_ctx_run_keyed.argtypes = [ctypes.c_void_p, i8p, i8p, u8p, u8p, u8p, ip, ip, ip, u32p]
+    lib.prl_mine_ctx_run_keyed.restype = ctypes.c_int
     lib.prl_mine_ctx_destroy.argtypes = [ctypes.c_void_p]
     print(f"CUDA devices: {lib.prl_mine_device_count()}")
 
@@ -86,11 +88,24 @@ def main() -> int:
         lib.prl_mine_ctx_destroy(h)
         ctx_match = (bool(cf.value) == bool(found.value) and car.value == a_row.value
                      and cbc.value == b_col.value and (not found.value or np.array_equal(ctr, tr)))
-        good = ok_found and ok_loc and ok_tr and ctx_match
+        # keyed path: noise generated ON-GPU from key_A/key_B (the production backend path)
+        kb = np.frombuffer(bytes.fromhex(case["key_B"]), dtype=np.uint8).copy()
+        hk = lib.prl_mine_ctx_create(m, k, n)
+        kf = ctypes.c_int(0); kar = ctypes.c_int(0); kbc = ctypes.c_int(0)
+        ktr = np.zeros(16, dtype=np.uint32)
+        lib.prl_mine_ctx_run_keyed(hk, pA, pB, key.ctypes.data_as(u8p), kb.ctypes.data_as(u8p),
+                                   tgt.ctypes.data_as(u8p), ctypes.byref(kf), ctypes.byref(kar),
+                                   ctypes.byref(kbc), ktr.ctypes.data_as(u32p))
+        lib.prl_mine_ctx_destroy(hk)
+        keyed_match = (bool(kf.value) == case["found_block"] and (not case["found_block"] or
+                       (kar.value == case["A_row_indices"][0] and kbc.value == case["B_column_indices"][0]
+                        and [hex(int(w)) for w in ktr] == case["transcript_words"])))
+        good = ok_found and ok_loc and ok_tr and ctx_match and keyed_match
         ok = ok and good
         print(f"  [{'PASS' if good else 'FAIL'}] {case['name']:26s} "
               f"found={'=' if ok_found else 'X'} loc={'=' if ok_loc else 'X'} "
-              f"transcript={'=' if ok_tr else 'X'} ctx={'=' if ctx_match else 'X'}")
+              f"transcript={'=' if ok_tr else 'X'} ctx={'=' if ctx_match else 'X'} "
+              f"keyed(gpu-noise)={'=' if keyed_match else 'X'}")
 
     print("FUSED MINER throughput (k_mine: noised GEMM + per-chunk transcript, kernel-only):")
     for (m, k, n) in [(128, 256, 256), (1024, 1024, 1024), (2048, 2048, 2048)]:

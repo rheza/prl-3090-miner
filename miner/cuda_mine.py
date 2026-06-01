@@ -40,6 +40,9 @@ class MineCuda:
         lib.prl_mine_ctx_run.argtypes = [ctypes.c_void_p, _i8, _i8, _i8, _i8, _i8, _i8,
                                          _u8, _u8, _ip, _ip, _ip, _u32]
         lib.prl_mine_ctx_run.restype = ctypes.c_int
+        lib.prl_mine_ctx_run_keyed.argtypes = [ctypes.c_void_p, _i8, _i8, _u8, _u8, _u8,
+                                               _ip, _ip, _ip, _u32]
+        lib.prl_mine_ctx_run_keyed.restype = ctypes.c_int
         lib.prl_mine_ctx_destroy.argtypes = [ctypes.c_void_p]
         self._lib = lib
         self._ctx: dict[tuple[int, int, int], int] = {}
@@ -75,6 +78,28 @@ class MineCuda:
                                         tr.ctypes.data_as(_u32))
         if rc != 0:
             raise RuntimeError(f"prl_mine_ctx_run rc={rc}: {self._lib.prl_mine_last_error().decode()}")
+        return bool(found.value), a_row.value, b_col.value, tr
+
+    def run_keyed(self, A, B, key_A: bytes, key_B: bytes, pow_target: int):
+        """Noise is generated ON-GPU from the keys (no Python BLAKE3 loop)."""
+        m, k = A.shape
+        n = B.shape[1]
+        h = self._ctx_for(m, k, n)
+        def p8(a):
+            a = np.ascontiguousarray(a, dtype=np.int8)
+            return a, a.ctypes.data_as(_i8)
+        A, pA = p8(A); B, pB = p8(B)
+        ka = np.frombuffer(key_A, dtype=np.uint8).copy()
+        kb = np.frombuffer(key_B, dtype=np.uint8).copy()
+        tgt = np.frombuffer(int(pow_target).to_bytes(32, "little"), dtype=np.uint8).copy()
+        found = ctypes.c_int(0); a_row = ctypes.c_int(0); b_col = ctypes.c_int(0)
+        tr = np.zeros(16, dtype=np.uint32)
+        rc = self._lib.prl_mine_ctx_run_keyed(h, pA, pB, ka.ctypes.data_as(_u8), kb.ctypes.data_as(_u8),
+                                              tgt.ctypes.data_as(_u8), ctypes.byref(found),
+                                              ctypes.byref(a_row), ctypes.byref(b_col),
+                                              tr.ctypes.data_as(_u32))
+        if rc != 0:
+            raise RuntimeError(f"prl_mine_ctx_run_keyed rc={rc}: {self._lib.prl_mine_last_error().decode()}")
         return bool(found.value), a_row.value, b_col.value, tr
 
     def __del__(self):
