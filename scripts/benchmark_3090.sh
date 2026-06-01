@@ -4,7 +4,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DURATION="${1:-300}"          # seconds (PRD: short 300, medium 3600, long 86400)
-BACKEND="${BACKEND:-cuda-sm86}"
+BACKEND="${BACKEND:-cuda-mine}"
 OUT="${OUT:-bench_$(date +%Y%m%d_%H%M%S)}"
 
 cd "$HERE"; . .venv/bin/activate 2>/dev/null || true
@@ -17,4 +17,4 @@ echo ">> prl3090-miner benchmark backend=$BACKEND duration=${DURATION}s"
 python -m miner benchmark --backend "$BACKEND" --duration "$DURATION" | tee "${OUT}.json"
 
 echo ">> dmon log: ${OUT}.dmon.log ; summary: ${OUT}.json"
-echo "   (For protocol TH/s, run against a node and read accepted proofs; harness MAC/s is not TH/s.)"
+echo "   (For protocol TH/s, use scripts/protocol_benchmark.py against accepted pool shares/proofs.)"

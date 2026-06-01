@@ -143,19 +143,59 @@ __global__ void k_mine(const int8_t* An,const int8_t* Bn,uint32_t* transcripts,i
 }
 
 // ---------- PoW scan (reference order, device BLAKE3) ----------
-__global__ void k_pow_scan(const uint32_t* transcripts,const uint32_t* key,const uint32_t* target,
-                           int m,int n,int r,int th,int tw,int* found,int* a_row,int* b_col,uint32_t* tr_out){
-    if(threadIdx.x||blockIdx.x) return;
-    int ST_cols=n/tw, TI=m/r, TJ=n/r, SH=r/th, SW=r/tw;
-    *found=0; *a_row=-1; *b_col=-1;
-    for(int ti=0;ti<TI;ti++) for(int tj=0;tj<TJ;tj++) for(int hi=0;hi<SH;hi++) for(int wi=0;wi<SW;wi++){
-        int sr=ti*SH+hi, sc=tj*SW+wi;
-        const uint32_t* tr=&transcripts[((size_t)sr*ST_cols+sc)*16];
-        uint32_t dig[8]; blake3_keyed_block(tr,key,dig);
-        bool le=true;
-        for(int l=7;l>=0;l--){ if(dig[l]<target[l]){le=true;break;} if(dig[l]>target[l]){le=false;break;} }
-        if(le){ *found=1; *a_row=sr*th; *b_col=sc*tw; for(int x=0;x<16;x++) tr_out[x]=tr[x]; return; }
+__device__ __forceinline__ void pow_scan_index_to_tile(int idx, int TJ, int SH, int SW,
+                                                       int* sr, int* sc) {
+    int wi = idx % SW; idx /= SW;
+    int hi = idx % SH; idx /= SH;
+    int tj = idx % TJ; idx /= TJ;
+    int ti = idx;
+    *sr = ti * SH + hi;
+    *sc = tj * SW + wi;
+}
+
+__device__ __forceinline__ bool digest_le_target(const uint32_t* digest, const uint32_t* target) {
+    for (int l = 7; l >= 0; --l) {
+        if (digest[l] < target[l]) return true;
+        if (digest[l] > target[l]) return false;
     }
+    return true;
+}
+
+__global__ void k_pow_scan_find(const uint32_t* transcripts, const uint32_t* key,
+                                const uint32_t* target, int m, int n, int r, int th,
+                                int tw, int* best_idx) {
+    int ST_cols = n / tw, TI = m / r, TJ = n / r, SH = r / th, SW = r / tw;
+    int total = TI * TJ * SH * SW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int sr, sc;
+    pow_scan_index_to_tile(idx, TJ, SH, SW, &sr, &sc);
+    const uint32_t* tr = &transcripts[((size_t)sr * ST_cols + sc) * 16];
+    uint32_t dig[8];
+    blake3_keyed_block(tr, key, dig);
+    if (digest_le_target(dig, target)) atomicMin(best_idx, idx);
+}
+
+__global__ void k_pow_scan_emit(const uint32_t* transcripts, int m, int n, int r, int th,
+                                int tw, const int* best_idx, int* found, int* a_row,
+                                int* b_col, uint32_t* tr_out) {
+    if (threadIdx.x || blockIdx.x) return;
+    int ST_cols = n / tw, TI = m / r, TJ = n / r, SH = r / th, SW = r / tw;
+    int total = TI * TJ * SH * SW;
+    int idx = *best_idx;
+    if (idx >= total) {
+        *found = 0;
+        *a_row = -1;
+        *b_col = -1;
+        return;
+    }
+    int sr, sc;
+    pow_scan_index_to_tile(idx, TJ, SH, SW, &sr, &sc);
+    const uint32_t* tr = &transcripts[((size_t)sr * ST_cols + sc) * 16];
+    *found = 1;
+    *a_row = sr * th;
+    *b_col = sc * tw;
+    for (int x = 0; x < 16; x++) tr_out[x] = tr[x];
 }
 
 // ---------- GPU noise generation (faithful to noise_generation.py) ----------
@@ -226,7 +266,7 @@ int prl_mine_run(const int8_t* A,const int8_t* B,const int8_t* EAL,const int8_t*
                  int* found,int* a_row,int* b_col,uint32_t* tr_out){
     const int r=128;
     if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need m%%128==n%%128==k%%128==0 (r=128)"); return 2; }
-    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn; uint32_t *dTr,*dKey,*dTgt,*dTrOut; int *dF,*dAR,*dBC;
+    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn; uint32_t *dTr,*dKey,*dTgt,*dTrOut; int *dF,*dAR,*dBC,*dBest;
     size_t ST=(size_t)(m/16)*(n/16);
     CK(cudaMalloc(&dA,(size_t)m*k));CK(cudaMalloc(&dB,(size_t)k*n));
     CK(cudaMalloc(&dEAL,(size_t)m*r));CK(cudaMalloc(&dEAR,(size_t)r*k));
@@ -234,7 +274,7 @@ int prl_mine_run(const int8_t* A,const int8_t* B,const int8_t* EAL,const int8_t*
     CK(cudaMalloc(&dAn,(size_t)m*k));CK(cudaMalloc(&dBn,(size_t)k*n));
     CK(cudaMalloc(&dTr,ST*16*4));CK(cudaMemset(dTr,0,ST*16*4));
     CK(cudaMalloc(&dKey,32));CK(cudaMalloc(&dTgt,32));CK(cudaMalloc(&dTrOut,64));
-    CK(cudaMalloc(&dF,4));CK(cudaMalloc(&dAR,4));CK(cudaMalloc(&dBC,4));
+    CK(cudaMalloc(&dF,4));CK(cudaMalloc(&dAR,4));CK(cudaMalloc(&dBC,4));CK(cudaMalloc(&dBest,4));
     CK(cudaMemcpy(dA,A,(size_t)m*k,cudaMemcpyHostToDevice));CK(cudaMemcpy(dB,B,(size_t)k*n,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dEAL,EAL,(size_t)m*r,cudaMemcpyHostToDevice));CK(cudaMemcpy(dEAR,EAR,(size_t)r*k,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dEBL,EBL,(size_t)k*r,cudaMemcpyHostToDevice));CK(cudaMemcpy(dEBR,EBR,(size_t)r*n,cudaMemcpyHostToDevice));
@@ -244,13 +284,16 @@ int prl_mine_run(const int8_t* A,const int8_t* B,const int8_t* EAL,const int8_t*
     k_noiseB<<<((size_t)k*n+T-1)/T,T>>>(dB,dEBL,dEBR,dBn,k,n,r);
     dim3 grid(m/128,n/128);
     k_mine<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
-    k_pow_scan<<<1,1>>>(dTr,dKey,dTgt,m,n,128,16,16,dF,dAR,dBC,dTrOut);
+    CK(cudaMemset(dBest,0x7f,4));
+    int total_tiles=(m/128)*(n/128)*8*8;
+    k_pow_scan_find<<<(total_tiles+T-1)/T,T>>>(dTr,dKey,dTgt,m,n,128,16,16,dBest);
+    k_pow_scan_emit<<<1,1>>>(dTr,m,n,128,16,16,dBest,dF,dAR,dBC,dTrOut);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(found,dF,4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(a_row,dAR,4,cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(b_col,dBC,4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(tr_out,dTrOut,64,cudaMemcpyDeviceToHost));
     cudaFree(dA);cudaFree(dB);cudaFree(dEAL);cudaFree(dEAR);cudaFree(dEBL);cudaFree(dEBR);
     cudaFree(dAn);cudaFree(dBn);cudaFree(dTr);cudaFree(dKey);cudaFree(dTgt);cudaFree(dTrOut);
-    cudaFree(dF);cudaFree(dAR);cudaFree(dBC);
+    cudaFree(dF);cudaFree(dAR);cudaFree(dBC);cudaFree(dBest);
     return 0;
 }
 
@@ -305,7 +348,7 @@ int prl_noisegen(const uint8_t* keyA, const uint8_t* keyB, int m, int k, int n,
 typedef struct PrlMineCtx {
     int m, k, n; size_t ST;
     int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn,*dU;
-    uint32_t *dTr,*dKey,*dKeyB,*dTgt,*dTrOut,*dSA,*dSB; int *dF,*dAR,*dBC;
+    uint32_t *dTr,*dKey,*dKeyB,*dTgt,*dTrOut,*dSA,*dSB; int *dF,*dAR,*dBC,*dBest;
     cudaStream_t stream;
 } PrlMineCtx;
 
@@ -321,7 +364,7 @@ void* prl_mine_ctx_create(int m, int k, int n) {
         && cudaMalloc(&c->dTr,c->ST*64)==cudaSuccess && cudaMalloc(&c->dKey,32)==cudaSuccess
         && cudaMalloc(&c->dTgt,32)==cudaSuccess && cudaMalloc(&c->dTrOut,64)==cudaSuccess
         && cudaMalloc(&c->dF,4)==cudaSuccess && cudaMalloc(&c->dAR,4)==cudaSuccess
-        && cudaMalloc(&c->dBC,4)==cudaSuccess
+        && cudaMalloc(&c->dBC,4)==cudaSuccess && cudaMalloc(&c->dBest,4)==cudaSuccess
         && cudaMalloc(&c->dKeyB,32)==cudaSuccess && cudaMalloc(&c->dSA,32)==cudaSuccess
         && cudaMalloc(&c->dSB,32)==cudaSuccess && cudaMalloc(&c->dU,(size_t)n*r)==cudaSuccess
         && cudaStreamCreate(&c->stream)==cudaSuccess;
@@ -353,7 +396,10 @@ int prl_mine_ctx_run(void* h, const int8_t* A, const int8_t* B, const int8_t* EA
     k_noiseB<<<((size_t)k*n+T-1)/T,T,0,s>>>(c->dB,c->dEBL,c->dEBR,c->dBn,k,n,r);
     dim3 grid(m/128,n/128);
     k_mine<<<grid,256,0,s>>>(c->dAn,c->dBn,c->dTr,m,k,n);
-    k_pow_scan<<<1,1,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dF,c->dAR,c->dBC,c->dTrOut);
+    cudaMemsetAsync(c->dBest,0x7f,4,s);
+    int total_tiles=(m/128)*(n/128)*8*8;
+    k_pow_scan_find<<<(total_tiles+T-1)/T,T,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dBest);
+    k_pow_scan_emit<<<1,1,0,s>>>(c->dTr,m,n,128,16,16,c->dBest,c->dF,c->dAR,c->dBC,c->dTrOut);
     cudaMemcpyAsync(found,c->dF,4,cudaMemcpyDeviceToHost,s);
     cudaMemcpyAsync(a_row,c->dAR,4,cudaMemcpyDeviceToHost,s);
     cudaMemcpyAsync(b_col,c->dBC,4,cudaMemcpyDeviceToHost,s);
@@ -388,7 +434,10 @@ int prl_mine_ctx_run_keyed(void* h, const int8_t* A, const int8_t* B,
     k_noiseB<<<(((size_t)k*n)+T-1)/T,T,0,s>>>(c->dB,c->dEBL,c->dEBR,c->dBn,k,n,r);
     dim3 grid(m/128,n/128);
     k_mine<<<grid,256,0,s>>>(c->dAn,c->dBn,c->dTr,m,k,n);
-    k_pow_scan<<<1,1,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dF,c->dAR,c->dBC,c->dTrOut);
+    cudaMemsetAsync(c->dBest,0x7f,4,s);
+    int total_tiles=(m/128)*(n/128)*8*8;
+    k_pow_scan_find<<<(total_tiles+T-1)/T,T,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dBest);
+    k_pow_scan_emit<<<1,1,0,s>>>(c->dTr,m,n,128,16,16,c->dBest,c->dF,c->dAR,c->dBC,c->dTrOut);
     cudaMemcpyAsync(found,c->dF,4,cudaMemcpyDeviceToHost,s);
     cudaMemcpyAsync(a_row,c->dAR,4,cudaMemcpyDeviceToHost,s);
     cudaMemcpyAsync(b_col,c->dBC,4,cudaMemcpyDeviceToHost,s);
@@ -405,6 +454,6 @@ void prl_mine_ctx_destroy(void* h) {
     cudaFree(c->dEBL); cudaFree(c->dEBR); cudaFree(c->dAn); cudaFree(c->dBn); cudaFree(c->dU);
     cudaFree(c->dTr); cudaFree(c->dKey); cudaFree(c->dKeyB); cudaFree(c->dTgt); cudaFree(c->dTrOut);
     cudaFree(c->dSA); cudaFree(c->dSB);
-    cudaFree(c->dF); cudaFree(c->dAR); cudaFree(c->dBC); cudaStreamDestroy(c->stream); free(c);
+    cudaFree(c->dF); cudaFree(c->dAR); cudaFree(c->dBC); cudaFree(c->dBest); cudaStreamDestroy(c->stream); free(c);
 }
 } // extern "C"

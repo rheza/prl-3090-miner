@@ -13,13 +13,13 @@ case "$MODE" in
         --section SpeedOfLight --section Occupancy --section MemoryWorkloadAnalysis \
         --section ComputeWorkloadAnalysis \
         -o "ncu_$(date +%s)" \
-        python -m miner benchmark --backend cuda-sm86 --duration 20
+        python -m miner benchmark --backend cuda-mine --duration 20
     ;;
   systems)  # stream overlap, job-switch latency, H2D/D2H transfers
     command -v nsys >/dev/null || { echo "Nsight Systems (nsys) not found"; exit 1; }
     nsys profile --trace=cuda,nvtx,osrt --gpu-metrics-device=all \
         -o "nsys_$(date +%s)" \
-        python -m miner benchmark --backend cuda-sm86 --duration 20
+        python -m miner benchmark --backend cuda-mine --duration 20
     ;;
   *) echo "usage: $0 [compute|systems]"; exit 2 ;;
 esac

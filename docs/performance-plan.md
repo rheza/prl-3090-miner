@@ -16,6 +16,8 @@ big-picture port are in [`cuda-sm86-port.md`](cuda-sm86-port.md); this is the op
    - Fuse denoise + transcript extraction into the mainloop epilogue (avoid extra passes).
    - `streams=2` to overlap job *N+1* H2D with job *N* compute; pinned host buffers; preallocate.
    - Keep NVML sampling on its own thread (already so in `nvml_monitor.cpp`).
+   - Keep PoW transcript scanning parallel and order-preserving; do not reintroduce a serial
+     post-kernel scan over candidate tiles.
 4. **Minimize job-switch latency:** the chain retargets every 3m14s but tips can change anytime; a found
    proof on a stale header is wasted. Make `should_stop` checked between k-tiles, cancel fast.
 5. **Reduce host overhead:** no Python in the hot loop (it isn't); batch submissions; avoid needless
@@ -32,3 +34,9 @@ and the eligible-warps stall reasons. Optimize the kernel with the worst SOL fir
 ## Milestone gates (PRD §21)
 - M6: ≥50 TH/s, stale <2%, reject <1%, stable 12 h.
 - M8: 80–110 TH/s depending on preset, stable 24 h, benchmarked vs AlphaMiner black box.
+
+## Clean-room parity rule
+AlphaMiner may be used only as a black-box benchmark. Record its reported TH/s, accepted shares, rejects,
+stales, watts, driver, clocks, pool region, worker name, and static difficulty. Do not decompile,
+disassemble, patch, trace proprietary internals, or copy behavior from private binaries. Use public Pearl
+source, public AlphaMiner documentation, pool-visible shares, and Nsight aggregate counters only.
