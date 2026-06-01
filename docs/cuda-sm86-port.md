@@ -134,6 +134,37 @@ This is why the golden vectors record the **winning tile's 16 transcript words**
 
 See [`STATUS.md`](../STATUS.md) for the honest current state and effort estimate.
 
+## 6b. Progress — verified on the RTX 3090 (sm_86, CUDA 12.9)
+
+All kernels below were compiled and validated **bit-for-bit against `tests/golden/` on the physical
+3090**. Throughput is kernel-only (cudaEvent), int8, MACs/s → TOPS (×2).
+
+| Kernel | What | Throughput | Golden |
+|---|---|---|---|
+| `naive_sm86.cu` | scalar integer-core full pipeline | ~2.9 GMAC/s (~0.006 TOPS) | C, found, indices, transcript, BLAKE3 ✅ |
+| `mma_gemm_sm86.cu` `k_mma_gemm` | mma.sync m16n8k32 GEMM, one warp/tile | 6.6 TOPS @1024³ | C ✅ |
+| `mma_gemm_sm86.cu` `k_mma_gemm_smem` | + 64×64 SMEM tiling | 16.7 TOPS @1024³ | C ✅ |
+| `mma_gemm_sm86.cu` `k_mma_gemm_cpasync` | + 128×128 tile, cp.async double-buffer | 23.6 @1024³, **53.9 @4096³** | C ✅ |
+| **`mine_sm86.cu` `k_mine`** | **FUSED real miner: noised GEMM + per-chunk transcript (register warp-XOR) + on-device BLAKE3** | **33.6 @1024³, 38.6 @2048³ TOPS** | **found, indices, transcript words ✅ (r=128)** |
+
+Peak reference: GA102 dense int8 ≈ **284 TOPS**. The fused miner is at ~13%; the plain GEMM ~19%.
+
+## 6c. The way to maximize the 3090 (prioritized, grounded in the above + Ampere GEMM practice)
+
+1. **Kill per-launch / per-attempt overhead** (biggest *real-miner* win): persistent device buffers, a
+   resident/streamed kernel, and batch many candidate tiles per launch. The orchestrator harness today
+   does malloc+copy+launch+free per attempt — that, not the kernel, caps the end-to-end loop.
+2. **`ldmatrix.x4` fragment loads** from SMEM instead of the current manual byte-`pk()` gathers —
+   bank-conflict-free and far fewer instructions; typically the single largest GEMM speedup remaining.
+3. **SMEM swizzle / XOR-permuted layout** to remove remaining bank conflicts in A/B staging.
+4. **Register + async double-buffering** of the mma pipeline (more cp.async stages, prefetch fragments).
+5. **Tile/occupancy tuning** to GA102 (larger block tiles within the 99 KB opt-in SMEM; balance regs).
+6. **Power/clock preset** (`docs/rtx3090-tuning.md`) for TOPS/W once correctness+throughput are fixed.
+
+Each step stays gated by `cuda/tests/validate_mine.py` (full golden incl. transcript words), so speed work
+can never silently break the PoW. Realistic open-kernel ceiling on GA102 int8 is ~150–200 TOPS
+(~50–70% of peak); the remaining gap from 38 TOPS is items 1–5, each well-understood.
+
 ## 7. Profiling toolchain (PRD §12.6)
 `scripts/profile_nsight.sh` wraps **Nsight Compute** (`ncu`) for per-kernel counters (tensor-core
 utilization, SMEM/occupancy, memory throughput) and **Nsight Systems** (`nsys`) for stream overlap and
