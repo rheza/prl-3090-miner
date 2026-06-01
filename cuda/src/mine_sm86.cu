@@ -198,6 +198,26 @@ __global__ void k_pow_scan_emit(const uint32_t* transcripts, int m, int n, int r
     for (int x = 0; x < 16; x++) tr_out[x] = tr[x];
 }
 
+__global__ void k_pow_scan_emit_batch(const uint32_t* transcripts, int m, int n, int r, int th,
+                                      int tw, const int* best_idx, int attempt_idx,
+                                      int* found_attempt, int* found, int* a_row,
+                                      int* b_col, uint32_t* tr_out) {
+    if (threadIdx.x || blockIdx.x) return;
+    const int sentinel = 0x7f7f7f7f;
+    int ST_cols = n / tw, TI = m / r, TJ = n / r, SH = r / th, SW = r / tw;
+    int total = TI * TJ * SH * SW;
+    int idx = *best_idx;
+    if (idx >= total) return;
+    if (atomicCAS(found_attempt, sentinel, attempt_idx) != sentinel) return;
+    int sr, sc;
+    pow_scan_index_to_tile(idx, TJ, SH, SW, &sr, &sc);
+    const uint32_t* tr = &transcripts[((size_t)sr * ST_cols + sc) * 16];
+    *found = 1;
+    *a_row = sr * th;
+    *b_col = sc * tw;
+    for (int x = 0; x < 16; x++) tr_out[x] = tr[x];
+}
+
 // ---------- GPU noise generation (faithful to noise_generation.py) ----------
 // Removes the per-attempt Python BLAKE3 noise loop (the 68% bottleneck) by deriving
 // E_AL/E_AR/E_BL/E_BR on-device from the 32-byte keys, exactly as NoiseGenerator does.
@@ -348,9 +368,77 @@ int prl_noisegen(const uint8_t* keyA, const uint8_t* keyB, int m, int k, int n,
 typedef struct PrlMineCtx {
     int m, k, n; size_t ST;
     int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn,*dU;
-    uint32_t *dTr,*dKey,*dKeyB,*dTgt,*dTrOut,*dSA,*dSB; int *dF,*dAR,*dBC,*dBest;
+    uint32_t *dTr,*dKey,*dKeyB,*dKeyBatch,*dKeyBBatch,*dTgt,*dTrOut,*dSA,*dSB;
+    int *dF,*dAR,*dBC,*dBest,*dFoundAttempt;
+    int key_batch_cap;
+    cudaGraph_t batch_graph;
+    cudaGraphExec_t batch_graph_exec;
+    int batch_graph_count;
     cudaStream_t stream;
 } PrlMineCtx;
+
+static void prl_mine_ctx_destroy_batch_graph(PrlMineCtx* c) {
+    if (c->batch_graph_exec) cudaGraphExecDestroy(c->batch_graph_exec);
+    if (c->batch_graph) cudaGraphDestroy(c->batch_graph);
+    c->batch_graph_exec = nullptr;
+    c->batch_graph = nullptr;
+    c->batch_graph_count = 0;
+}
+
+static int prl_mine_ctx_ensure_key_batch(PrlMineCtx* c, int count) {
+    if (count <= c->key_batch_cap) return 0;
+    prl_mine_ctx_destroy_batch_graph(c);
+    cudaFree(c->dKeyBatch);
+    cudaFree(c->dKeyBBatch);
+    c->dKeyBatch = nullptr;
+    c->dKeyBBatch = nullptr;
+    cudaError_t e = cudaMalloc(&c->dKeyBatch, (size_t)count * 32);
+    if (e != cudaSuccess) { snprintf(g_err,sizeof(g_err),"key_batch alloc A: %s",cudaGetErrorString(e)); return 4; }
+    e = cudaMalloc(&c->dKeyBBatch, (size_t)count * 32);
+    if (e != cudaSuccess) { snprintf(g_err,sizeof(g_err),"key_batch alloc B: %s",cudaGetErrorString(e)); return 4; }
+    c->key_batch_cap = count;
+    return 0;
+}
+
+static int prl_mine_ctx_build_batch_graph(PrlMineCtx* c, int count) {
+    if (c->batch_graph_exec && c->batch_graph_count == count) return 0;
+    prl_mine_ctx_destroy_batch_graph(c);
+    int m=c->m, k=c->k, n=c->n; const int r=128; cudaStream_t s=c->stream; int T=256;
+    dim3 grid(m/128,n/128);
+    int total_tiles=(m/128)*(n/128)*8*8;
+
+    cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+    if (e != cudaSuccess) { snprintf(g_err,sizeof(g_err),"graph begin: %s",cudaGetErrorString(e)); return 4; }
+    cudaMemsetAsync(c->dFoundAttempt,0x7f,4,s);
+    cudaMemsetAsync(c->dF,0,4,s);
+    cudaMemsetAsync(c->dAR,0xff,4,s);
+    cudaMemsetAsync(c->dBC,0xff,4,s);
+    for (int i=0; i<count; ++i) {
+        const uint32_t* keyA = c->dKeyBatch + i*8;
+        const uint32_t* keyB = c->dKeyBBatch + i*8;
+        cudaMemsetAsync(c->dTr,0,c->ST*64,s);
+        cudaMemsetAsync(c->dEAR,0,(size_t)r*k,s);
+        cudaMemsetAsync(c->dEBL,0,(size_t)k*r,s);
+        k_ng_dense<<<((((m*r+31)/32))+T-1)/T,T,0,s>>>(keyA,c->dSA,m*r,c->dEAL);
+        k_ng_perm<<<((((k+7)/8))+T-1)/T,T,0,s>>>(keyA,c->dSA,k,1,r,k,c->dEAR);
+        k_ng_perm<<<((((k+7)/8))+T-1)/T,T,0,s>>>(keyB,c->dSB,k,0,r,k,c->dEBL);
+        k_ng_dense<<<((((n*r+31)/32))+T-1)/T,T,0,s>>>(keyB,c->dSB,n*r,c->dU);
+        k_transpose<<<(((size_t)n*r)+T-1)/T,T,0,s>>>(c->dU,c->dEBR,n,r);
+        k_noiseA<<<(((size_t)m*k)+T-1)/T,T,0,s>>>(c->dA,c->dEAL,c->dEAR,c->dAn,m,k,r);
+        k_noiseB<<<(((size_t)k*n)+T-1)/T,T,0,s>>>(c->dB,c->dEBL,c->dEBR,c->dBn,k,n,r);
+        k_mine<<<grid,256,0,s>>>(c->dAn,c->dBn,c->dTr,m,k,n);
+        cudaMemsetAsync(c->dBest,0x7f,4,s);
+        k_pow_scan_find<<<(total_tiles+T-1)/T,T,0,s>>>(c->dTr,keyA,c->dTgt,m,n,128,16,16,c->dBest);
+        k_pow_scan_emit_batch<<<1,1,0,s>>>(c->dTr,m,n,128,16,16,c->dBest,i,
+                                           c->dFoundAttempt,c->dF,c->dAR,c->dBC,c->dTrOut);
+    }
+    e = cudaStreamEndCapture(s, &c->batch_graph);
+    if (e != cudaSuccess) { snprintf(g_err,sizeof(g_err),"graph end: %s",cudaGetErrorString(e)); return 4; }
+    e = cudaGraphInstantiate(&c->batch_graph_exec, c->batch_graph, nullptr, nullptr, 0);
+    if (e != cudaSuccess) { snprintf(g_err,sizeof(g_err),"graph instantiate: %s",cudaGetErrorString(e)); return 4; }
+    c->batch_graph_count = count;
+    return 0;
+}
 
 void* prl_mine_ctx_create(int m, int k, int n) {
     if (m%128 || n%128 || k%128) { snprintf(g_err,sizeof(g_err),"ctx: need m%%128==n%%128==k%%128==0"); return nullptr; }
@@ -365,6 +453,7 @@ void* prl_mine_ctx_create(int m, int k, int n) {
         && cudaMalloc(&c->dTgt,32)==cudaSuccess && cudaMalloc(&c->dTrOut,64)==cudaSuccess
         && cudaMalloc(&c->dF,4)==cudaSuccess && cudaMalloc(&c->dAR,4)==cudaSuccess
         && cudaMalloc(&c->dBC,4)==cudaSuccess && cudaMalloc(&c->dBest,4)==cudaSuccess
+        && cudaMalloc(&c->dFoundAttempt,4)==cudaSuccess
         && cudaMalloc(&c->dKeyB,32)==cudaSuccess && cudaMalloc(&c->dSA,32)==cudaSuccess
         && cudaMalloc(&c->dSB,32)==cudaSuccess && cudaMalloc(&c->dU,(size_t)n*r)==cudaSuccess
         && cudaStreamCreate(&c->stream)==cudaSuccess;
@@ -448,12 +537,89 @@ int prl_mine_ctx_run_keyed(void* h, const int8_t* A, const int8_t* B,
     return 0;
 }
 
+// Preload A/B once for a job, then run many keyed attempts against device-resident inputs.
+// This is the intended fast path for model-sourced production tensors and removes two large
+// host-to-device copies plus Python A/B generation from every harness attempt.
+int prl_mine_ctx_set_inputs(void* h, const int8_t* A, const int8_t* B) {
+    PrlMineCtx* c=(PrlMineCtx*)h; if(!c) return 2;
+    cudaStream_t s=c->stream;
+    cudaMemcpyAsync(c->dA,A,(size_t)c->m*c->k,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dB,B,(size_t)c->k*c->n,cudaMemcpyHostToDevice,s);
+    cudaStreamSynchronize(s);
+    cudaError_t e=cudaGetLastError();
+    if (e!=cudaSuccess){ snprintf(g_err,sizeof(g_err),"ctx_set_inputs: %s",cudaGetErrorString(e)); return 4; }
+    return 0;
+}
+
+int prl_mine_ctx_run_keyed_preloaded(void* h, const uint8_t* keyA32, const uint8_t* keyB32,
+                                     const uint8_t* target32, int* found, int* a_row,
+                                     int* b_col, uint32_t* tr_out) {
+    PrlMineCtx* c=(PrlMineCtx*)h; if(!c) return 2;
+    int m=c->m, k=c->k, n=c->n; const int r=128; cudaStream_t s=c->stream; int T=256;
+    cudaMemcpyAsync(c->dKey,keyA32,32,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dKeyB,keyB32,32,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dTgt,target32,32,cudaMemcpyHostToDevice,s);
+    cudaMemsetAsync(c->dTr,0,c->ST*64,s);
+    cudaMemsetAsync(c->dEAR,0,(size_t)r*k,s);
+    cudaMemsetAsync(c->dEBL,0,(size_t)k*r,s);
+    k_ng_dense<<<((((m*r+31)/32))+T-1)/T,T,0,s>>>(c->dKey,c->dSA,m*r,c->dEAL);
+    k_ng_perm<<<((((k+7)/8))+T-1)/T,T,0,s>>>(c->dKey,c->dSA,k,1,r,k,c->dEAR);
+    k_ng_perm<<<((((k+7)/8))+T-1)/T,T,0,s>>>(c->dKeyB,c->dSB,k,0,r,k,c->dEBL);
+    k_ng_dense<<<((((n*r+31)/32))+T-1)/T,T,0,s>>>(c->dKeyB,c->dSB,n*r,c->dU);
+    k_transpose<<<(((size_t)n*r)+T-1)/T,T,0,s>>>(c->dU,c->dEBR,n,r);
+    k_noiseA<<<(((size_t)m*k)+T-1)/T,T,0,s>>>(c->dA,c->dEAL,c->dEAR,c->dAn,m,k,r);
+    k_noiseB<<<(((size_t)k*n)+T-1)/T,T,0,s>>>(c->dB,c->dEBL,c->dEBR,c->dBn,k,n,r);
+    dim3 grid(m/128,n/128);
+    k_mine<<<grid,256,0,s>>>(c->dAn,c->dBn,c->dTr,m,k,n);
+    cudaMemsetAsync(c->dBest,0x7f,4,s);
+    int total_tiles=(m/128)*(n/128)*8*8;
+    k_pow_scan_find<<<(total_tiles+T-1)/T,T,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dBest);
+    k_pow_scan_emit<<<1,1,0,s>>>(c->dTr,m,n,128,16,16,c->dBest,c->dF,c->dAR,c->dBC,c->dTrOut);
+    cudaMemcpyAsync(found,c->dF,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(a_row,c->dAR,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(b_col,c->dBC,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(tr_out,c->dTrOut,64,cudaMemcpyDeviceToHost,s);
+    cudaStreamSynchronize(s);
+    cudaError_t e=cudaGetLastError();
+    if (e!=cudaSuccess){ snprintf(g_err,sizeof(g_err),"ctx_run_keyed_preloaded: %s",cudaGetErrorString(e)); return 4; }
+    return 0;
+}
+
+int prl_mine_ctx_run_keyed_preloaded_batch(void* h, const uint8_t* keysA32,
+                                           const uint8_t* keysB32, int count,
+                                           const uint8_t* target32, int* found_attempt,
+                                           int* found, int* a_row, int* b_col,
+                                           uint32_t* tr_out) {
+    PrlMineCtx* c=(PrlMineCtx*)h; if(!c || count <= 0) return 2;
+    int rc = prl_mine_ctx_ensure_key_batch(c, count);
+    if (rc != 0) return rc;
+    rc = prl_mine_ctx_build_batch_graph(c, count);
+    if (rc != 0) return rc;
+    cudaStream_t s=c->stream;
+    cudaMemcpyAsync(c->dKeyBatch,keysA32,(size_t)count*32,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dKeyBBatch,keysB32,(size_t)count*32,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dTgt,target32,32,cudaMemcpyHostToDevice,s);
+    cudaGraphLaunch(c->batch_graph_exec,s);
+    cudaMemcpyAsync(found_attempt,c->dFoundAttempt,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(found,c->dF,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(a_row,c->dAR,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(b_col,c->dBC,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(tr_out,c->dTrOut,64,cudaMemcpyDeviceToHost,s);
+    cudaStreamSynchronize(s);
+    cudaError_t e=cudaGetLastError();
+    if (e!=cudaSuccess){ snprintf(g_err,sizeof(g_err),"ctx_run_keyed_preloaded_batch: %s",cudaGetErrorString(e)); return 4; }
+    return 0;
+}
+
 void prl_mine_ctx_destroy(void* h) {
     PrlMineCtx* c = (PrlMineCtx*)h; if (!c) return;
+    prl_mine_ctx_destroy_batch_graph(c);
     cudaFree(c->dA); cudaFree(c->dB); cudaFree(c->dEAL); cudaFree(c->dEAR);
     cudaFree(c->dEBL); cudaFree(c->dEBR); cudaFree(c->dAn); cudaFree(c->dBn); cudaFree(c->dU);
     cudaFree(c->dTr); cudaFree(c->dKey); cudaFree(c->dKeyB); cudaFree(c->dTgt); cudaFree(c->dTrOut);
+    cudaFree(c->dKeyBatch); cudaFree(c->dKeyBBatch);
     cudaFree(c->dSA); cudaFree(c->dSB);
-    cudaFree(c->dF); cudaFree(c->dAR); cudaFree(c->dBC); cudaFree(c->dBest); cudaStreamDestroy(c->stream); free(c);
+    cudaFree(c->dF); cudaFree(c->dAR); cudaFree(c->dBC); cudaFree(c->dBest);
+    cudaFree(c->dFoundAttempt); cudaStreamDestroy(c->stream); free(c);
 }
 } // extern "C"

@@ -18,6 +18,7 @@ search. Two backends exist:
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -136,9 +137,11 @@ class CudaNaiveBackend:
 class CudaMineBackend:
     """The FUSED tensor-core miner kernel (cuda/build/libprl_miner.so) — the real hot loop.
 
-    Validated bit-for-bit vs golden on the GPU (cuda/tests/validate_mine.py), ~38 TOPS.
-    Like the other backends it synthesizes A/B from the header (no vLLM model here), so it
-    is a harness for the kernel; production sources A/B from the model. Linux/WSL only;
+    Validated bit-for-bit vs golden on the GPU (cuda/tests/validate_mine.py). Like the
+    other backends it synthesizes A/B from the header (no vLLM model here), so it is a
+    harness for the kernel; production sources A/B from the model. A/B are preloaded once
+    per job and keyed noise varies per attempt, matching the intended device-resident
+    tensor path instead of recopying matrices on every attempt. Linux/WSL only;
     specialized for noise_rank=128 (shape 128x256x256).
     """
 
@@ -149,7 +152,8 @@ class CudaMineBackend:
         from .cuda_mine import MineCuda
         self.device = device
         self._cuda = MineCuda()
-        self._noise = NoiseGenerator(noise_rank=self.R)
+        self._preloaded_header_id: bytes | None = None
+        self._batch_size = max(1, int(os.environ.get("PRL_CUDA_BATCH", "256")))
 
     def device_info(self) -> dict:
         gpus = list_gpus()
@@ -159,20 +163,36 @@ class CudaMineBackend:
 
     def search(self, job: MiningJob, attempt: int) -> BackendResult:
         hdr = job.incomplete_header_bytes
-        seed = int.from_bytes(blake3(hdr + attempt.to_bytes(8, "little")).digest()[:8], "little")
-        rng = np.random.default_rng(seed)
-        A = rng.integers(-64, 64, size=(self.M, self.K), dtype=np.int8)
-        B = rng.integers(-64, 64, size=(self.K, self.N), dtype=np.int8)
-        key_A = blake3(hdr + b"A").digest()
-        key_B = blake3(hdr + b"B").digest()
+        if self._preloaded_header_id != job.header_id:
+            seed = int.from_bytes(blake3(hdr + b"AB").digest()[:8], "little")
+            rng = np.random.default_rng(seed)
+            A = rng.integers(-64, 64, size=(self.M, self.K), dtype=np.int8)
+            B = rng.integers(-64, 64, size=(self.K, self.N), dtype=np.int8)
+            self._cuda.preload_inputs(A, B)
+            self._preloaded_header_id = job.header_id
+        batch = self._batch_size if job.target == 0 else 1
+        keys_A = []
+        keys_B = []
+        for i in range(batch):
+            nonce = (attempt + i).to_bytes(8, "little")
+            keys_A.append(blake3(hdr + nonce + b"A").digest())
+            keys_B.append(blake3(hdr + nonce + b"B").digest())
         # noise is generated ON-GPU from the keys (no Python BLAKE3 loop — the old 68% bottleneck)
-        found, a_row, b_col, tr = self._cuda.run_keyed(A, B, key_A, key_B, job.target)
+        if batch == 1:
+            found, a_row, b_col, tr = self._cuda.run_keyed_preloaded((self.M, self.K, self.N),
+                                                                     keys_A[0], keys_B[0], job.target)
+            found_attempt = 0
+        else:
+            found_attempt, found, a_row, b_col, tr = self._cuda.run_keyed_preloaded_batch(
+                (self.M, self.K, self.N), keys_A, keys_B, job.target)
         work = self.M * self.K * self.N
         if not found:
-            return BackendResult(False, None, work, {"attempt": attempt})
+            return BackendResult(False, None, work * batch, {"attempt": attempt, "attempts": batch})
         proof = json.dumps({"_harness": True, "a_row": a_row, "b_col": b_col,
                             "transcript_words": [hex(int(w)) for w in tr]}).encode()
-        return BackendResult(True, proof, work, {"attempt": attempt, "a_row": a_row, "b_col": b_col})
+        return BackendResult(True, proof, work * (found_attempt + 1),
+                             {"attempt": attempt + found_attempt, "attempts": found_attempt + 1,
+                              "a_row": a_row, "b_col": b_col})
 
 
 class CudaSm86Backend:

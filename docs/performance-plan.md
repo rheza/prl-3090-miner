@@ -18,6 +18,8 @@ big-picture port are in [`cuda-sm86-port.md`](cuda-sm86-port.md); this is the op
    - Keep NVML sampling on its own thread (already so in `nvml_monitor.cpp`).
    - Keep PoW transcript scanning parallel and order-preserving; do not reintroduce a serial
      post-kernel scan over candidate tiles.
+   - Keep benchmark hard-target attempts batched behind CUDA Graph replay; this is now the default
+     harness path (`PRL_CUDA_BATCH=256`).
 4. **Minimize job-switch latency:** the chain retargets every 3m14s but tips can change anytime; a found
    proof on a stale header is wasted. Make `should_stop` checked between k-tiles, cancel fast.
 5. **Reduce host overhead:** no Python in the hot loop (it isn't); batch submissions; avoid needless

@@ -157,9 +157,10 @@ def mine_loop(client: GatewayClient, backend, metrics: Metrics, safety: SafetyMo
         t0 = time.monotonic()
         result: BackendResult = backend.search(job, attempt)
         metrics.last_kernel_ms = (time.monotonic() - t0) * 1e3
-        metrics.attempts += 1
+        attempted = int(result.detail.get("attempts", 1))
+        metrics.attempts += attempted
         metrics.work_units += result.work_units
-        attempt += 1
+        attempt += attempted
 
         if result.found and result.plain_proof is not None:
             # stale cancellation: re-confirm the header is still current before submitting (§3.4).

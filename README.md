@@ -79,8 +79,8 @@ Latest local verification on the visible RTX 3090 (`driver 591.86`, `24 GB`) sho
 | `reference/run_cuda_golden.py` | All 6 golden cases pass | `cuda-naive` is still the full correctness oracle, including C, found flags, locations, transcript, and device BLAKE3. |
 | `cuda/tests/validate_noisegen.py` | All pass | GPU noise derivation is bit-exact for the checked shapes. |
 | `cuda/tests/validate_mine.py` | All production `noise_rank=128` cases pass | `cuda-mine` matches the golden found/not-found state, winning indices, transcript words, persistent context path, and keyed GPU-noise path. |
-| `validate_mine.py` kernel-only throughput | ~41.5 TOPS at `2048^3` | CUDA-event timing of fused noised GEMM + transcript + BLAKE3. Useful for kernel tuning. |
-| `miner benchmark --backend cuda-mine --duration 6` | 4,611 attempts, ~6.44 GMAC/s harness throughput | End-to-end Python harness throughput including synthetic A/B generation, host/device traffic, launches, and keyed GPU noise. Useful for regression checks. |
+| `validate_mine.py` kernel-only throughput | ~44 TOPS at `2048^3` | CUDA-event timing of fused noised GEMM + transcript + BLAKE3. Useful for kernel tuning. |
+| `miner benchmark --backend cuda-mine --duration 60` | 785,920 attempts, ~109.85 GMAC/s harness throughput | End-to-end benchmark path with preloaded A/B, keyed GPU noise, batched candidates, and CUDA Graph replay. Useful for regression checks. |
 
 Do **not** read those as Pearl protocol hashrate. A real TH/s number requires accepted proofs against a
 live node/gateway or accepted pool shares over a sustained run, with stale and reject rates included.

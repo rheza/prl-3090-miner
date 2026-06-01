@@ -74,9 +74,10 @@ def cmd_benchmark(args) -> int:
     attempt = 0
     while time.monotonic() < end:
         r = backend.search(job, attempt)
+        attempted = int(r.detail.get("attempts", 1))
         metrics.work_units += r.work_units
-        metrics.attempts += 1
-        attempt += 1
+        metrics.attempts += attempted
+        attempt += attempted
     secs = metrics.uptime()
     macs = metrics.throughput_macs_per_s()
     print(json.dumps({

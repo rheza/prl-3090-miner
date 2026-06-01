@@ -61,6 +61,18 @@ for a smoke baseline, 1 h for tuning decisions, and 24 h before claiming parity.
 ## Durations
 Short 5 min · Medium 1 h · Long 24 h (PRD §24). Use long runs for stale/reject rate and thermal stability.
 
+## Current local harness baseline
+On the local RTX 3090 (`driver 591.86`, CUDA 12.9), the current `cuda-mine` benchmark path uses
+device-resident A/B tensors, keyed GPU noise, batched hard-target candidates, and CUDA Graph replay.
+
+```bash
+python -m miner.prl3090_miner benchmark --backend cuda-mine --duration 60
+```
+
+Latest measured result: **785,920 attempts / 60s**, **~109.85 GMAC/s**, active telemetry around
+**84% SM**, **2.05 GHz**, and **190 W**. Override the benchmark graph size with `PRL_CUDA_BATCH=N`;
+the default is `256` after local tuning.
+
 ## Output schemas
 `scripts/benchmark_3090.sh` emits harness JSON alongside an `nvidia-smi dmon` log:
 ```json
