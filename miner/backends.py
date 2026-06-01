@@ -133,6 +133,49 @@ class CudaNaiveBackend:
         return BackendResult(True, proof, work, {"attempt": attempt, "a_row": a_row, "b_col": b_col})
 
 
+class CudaMineBackend:
+    """The FUSED tensor-core miner kernel (cuda/build/libprl_miner.so) — the real hot loop.
+
+    Validated bit-for-bit vs golden on the GPU (cuda/tests/validate_mine.py), ~38 TOPS.
+    Like the other backends it synthesizes A/B from the header (no vLLM model here), so it
+    is a harness for the kernel; production sources A/B from the model. Linux/WSL only;
+    specialized for noise_rank=128 (shape 128x256x256).
+    """
+
+    name = "cuda-mine"
+    M, K, N, R = 128, 256, 256, 128
+
+    def __init__(self, device: int = 0) -> None:
+        from .cuda_mine import MineCuda
+        self.device = device
+        self._cuda = MineCuda()
+        self._noise = NoiseGenerator(noise_rank=self.R)
+
+    def device_info(self) -> dict:
+        gpus = list_gpus()
+        g = gpus[self.device] if self.device < len(gpus) else {}
+        return {"name": g.get("name", "CUDA GPU"), "backend": self.name,
+                "temp_c": g.get("temp_c"), "vram_temp_c": None, "power_w": g.get("power_w")}
+
+    def search(self, job: MiningJob, attempt: int) -> BackendResult:
+        hdr = job.incomplete_header_bytes
+        seed = int.from_bytes(blake3(hdr + attempt.to_bytes(8, "little")).digest()[:8], "little")
+        rng = np.random.default_rng(seed)
+        A = rng.integers(-64, 64, size=(self.M, self.K), dtype=np.int8)
+        B = rng.integers(-64, 64, size=(self.K, self.N), dtype=np.int8)
+        key_A = blake3(hdr + b"A").digest()
+        key_B = blake3(hdr + b"B").digest()
+        E_AL, E_AR, E_BL, E_BR = self._noise.generate(key_A, key_B, self.M, self.K, self.N)
+        found, a_row, b_col, tr = self._cuda.run(A, B, E_AL, E_AR, E_BL, E_BR,
+                                                 pow_key=key_A, pow_target=job.target)
+        work = self.M * self.K * self.N
+        if not found:
+            return BackendResult(False, None, work, {"attempt": attempt})
+        proof = json.dumps({"_harness": True, "a_row": a_row, "b_col": b_col,
+                            "transcript_words": [hex(int(w)) for w in tr]}).encode()
+        return BackendResult(True, proof, work, {"attempt": attempt, "a_row": a_row, "b_col": b_col})
+
+
 class CudaSm86Backend:
     """Loads the compiled (tensor-core) sm_86 kernels. Until built, fails with guidance."""
 
@@ -162,9 +205,11 @@ def make_backend(name: str, device: int = 0):
         return CpuBackend()
     if name == "cuda-naive":
         return CudaNaiveBackend(device=device)
+    if name == "cuda-mine":
+        return CudaMineBackend(device=device)
     if name == "cuda-sm86":
         return CudaSm86Backend(device=device)
-    raise ValueError(f"unknown backend '{name}' (choices: cpu, cuda-naive, cuda-sm86)")
+    raise ValueError(f"unknown backend '{name}' (choices: cpu, cuda-naive, cuda-mine, cuda-sm86)")
 
 
 def list_gpus() -> list[dict]:
