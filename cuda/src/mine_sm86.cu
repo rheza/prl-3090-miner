@@ -90,26 +90,31 @@ __global__ void k_mine(const int8_t* An,const int8_t* Bn,uint32_t* transcripts,i
         int cur=ks&1;
         if(ks+1<nk){ LOAD((ks+1)&1,(ks+1)*32); cp_commit(); cp_wait1(); } else cp_wait0();
         __syncthreads();
+        // B fragments are independent of mrow — compute all 8 ncol ONCE and reuse across
+        // both mrow (halves the strided B SMEM loads, the bank-conflicted bottleneck).
+        const int8_t* Bb=&Bs[cur][0];
+        uint32_t bf0[8], bf1[8];
+        #pragma unroll
+        for(int ncol=0;ncol<8;ncol++){
+            int bcol=wc*64+ncol*8+g;
+            bf0[ncol]=pk(Bb[(t*4)*128+bcol],Bb[(t*4+1)*128+bcol],Bb[(t*4+2)*128+bcol],Bb[(t*4+3)*128+bcol]);
+            bf1[ncol]=pk(Bb[(t*4+16)*128+bcol],Bb[(t*4+17)*128+bcol],Bb[(t*4+18)*128+bcol],Bb[(t*4+19)*128+bcol]);
+        }
         #pragma unroll
         for(int mrow=0;mrow<2;mrow++){
             int arow=wr*32+mrow*16;
             const int8_t* Ar0=&As[cur][(arow+g)*32];
             const int8_t* Ar8=&As[cur][(arow+g+8)*32];
-            // vectorized: 4 contiguous int8 == one little-endian 32-bit word (== pk()).
             uint32_t a0=*(const uint32_t*)(Ar0+t*4);
             uint32_t a1=*(const uint32_t*)(Ar8+t*4);
             uint32_t a2=*(const uint32_t*)(Ar0+t*4+16);
             uint32_t a3=*(const uint32_t*)(Ar8+t*4+16);
-            const int8_t* Bb=&Bs[cur][0];
             #pragma unroll
             for(int ncol=0;ncol<8;ncol++){
-                int bcol=wc*64+ncol*8+g;
-                uint32_t b0=pk(Bb[(t*4)*128+bcol],Bb[(t*4+1)*128+bcol],Bb[(t*4+2)*128+bcol],Bb[(t*4+3)*128+bcol]);
-                uint32_t b1=pk(Bb[(t*4+16)*128+bcol],Bb[(t*4+17)*128+bcol],Bb[(t*4+18)*128+bcol],Bb[(t*4+19)*128+bcol]);
                 int* c=acc[mrow][ncol];
                 asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
                   :"+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
-                  :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+                  :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(bf0[ncol]),"r"(bf1[ncol]));
             }
         }
         __syncthreads();
