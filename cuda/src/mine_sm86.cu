@@ -12,6 +12,7 @@
 // 4 mma k-steps of 32. Requires m%128==n%128==k%128==0, hash_tile=16.
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 // ---------- device BLAKE3 (single 64-byte keyed block) ----------
@@ -93,10 +94,11 @@ __global__ void k_mine(const int8_t* An,const int8_t* Bn,uint32_t* transcripts,i
             int arow=wr*32+mrow*16;
             const int8_t* Ar0=&As[cur][(arow+g)*32];
             const int8_t* Ar8=&As[cur][(arow+g+8)*32];
-            uint32_t a0=pk(Ar0[t*4],Ar0[t*4+1],Ar0[t*4+2],Ar0[t*4+3]);
-            uint32_t a1=pk(Ar8[t*4],Ar8[t*4+1],Ar8[t*4+2],Ar8[t*4+3]);
-            uint32_t a2=pk(Ar0[t*4+16],Ar0[t*4+17],Ar0[t*4+18],Ar0[t*4+19]);
-            uint32_t a3=pk(Ar8[t*4+16],Ar8[t*4+17],Ar8[t*4+18],Ar8[t*4+19]);
+            // vectorized: 4 contiguous int8 == one little-endian 32-bit word (== pk()).
+            uint32_t a0=*(const uint32_t*)(Ar0+t*4);
+            uint32_t a1=*(const uint32_t*)(Ar8+t*4);
+            uint32_t a2=*(const uint32_t*)(Ar0+t*4+16);
+            uint32_t a3=*(const uint32_t*)(Ar8+t*4+16);
             const int8_t* Bb=&Bs[cur][0];
             #pragma unroll
             for(int ncol=0;ncol<8;ncol++){
@@ -207,5 +209,70 @@ int prl_mine_bench(int m,int k,int n,int iters,double* out_ms){
     cudaEventRecord(e); CK(cudaEventSynchronize(e));
     float ms=0; cudaEventElapsedTime(&ms,s,e); *out_ms=(double)ms/iters;
     cudaEventDestroy(s);cudaEventDestroy(e); cudaFree(dAn);cudaFree(dBn);cudaFree(dTr); return 0;
+}
+
+// ---- Persistent context: malloc device buffers + a stream ONCE, reuse per attempt ----
+// This removes the per-attempt cudaMalloc/cudaFree that caps the orchestrator loop (the
+// kernel itself is ~38 TOPS). All work runs on the context's stream with async copies.
+typedef struct PrlMineCtx {
+    int m, k, n; size_t ST;
+    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn;
+    uint32_t *dTr,*dKey,*dTgt,*dTrOut; int *dF,*dAR,*dBC;
+    cudaStream_t stream;
+} PrlMineCtx;
+
+void* prl_mine_ctx_create(int m, int k, int n) {
+    if (m%128 || n%128 || k%128) { snprintf(g_err,sizeof(g_err),"ctx: need m%%128==n%%128==k%%128==0"); return nullptr; }
+    PrlMineCtx* c = (PrlMineCtx*)calloc(1, sizeof(PrlMineCtx));
+    const int r = 128; c->m=m; c->k=k; c->n=n; c->ST=(size_t)(m/16)*(n/16);
+    bool ok = cudaMalloc(&c->dA,(size_t)m*k)==cudaSuccess
+        && cudaMalloc(&c->dB,(size_t)k*n)==cudaSuccess
+        && cudaMalloc(&c->dEAL,(size_t)m*r)==cudaSuccess && cudaMalloc(&c->dEAR,(size_t)r*k)==cudaSuccess
+        && cudaMalloc(&c->dEBL,(size_t)k*r)==cudaSuccess && cudaMalloc(&c->dEBR,(size_t)r*n)==cudaSuccess
+        && cudaMalloc(&c->dAn,(size_t)m*k)==cudaSuccess && cudaMalloc(&c->dBn,(size_t)k*n)==cudaSuccess
+        && cudaMalloc(&c->dTr,c->ST*64)==cudaSuccess && cudaMalloc(&c->dKey,32)==cudaSuccess
+        && cudaMalloc(&c->dTgt,32)==cudaSuccess && cudaMalloc(&c->dTrOut,64)==cudaSuccess
+        && cudaMalloc(&c->dF,4)==cudaSuccess && cudaMalloc(&c->dAR,4)==cudaSuccess
+        && cudaMalloc(&c->dBC,4)==cudaSuccess && cudaStreamCreate(&c->stream)==cudaSuccess;
+    if (!ok) { snprintf(g_err,sizeof(g_err),"ctx_create: alloc failed"); return nullptr; }
+    return c;
+}
+
+int prl_mine_ctx_run(void* h, const int8_t* A, const int8_t* B, const int8_t* EAL, const int8_t* EAR,
+                     const int8_t* EBL, const int8_t* EBR, const uint8_t* key32, const uint8_t* target32,
+                     int* found, int* a_row, int* b_col, uint32_t* tr_out) {
+    PrlMineCtx* c = (PrlMineCtx*)h; if (!c) return 2;
+    int m=c->m, k=c->k, n=c->n; const int r=128; cudaStream_t s=c->stream;
+    cudaMemcpyAsync(c->dA,A,(size_t)m*k,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dB,B,(size_t)k*n,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dEAL,EAL,(size_t)m*r,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dEAR,EAR,(size_t)r*k,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dEBL,EBL,(size_t)k*r,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dEBR,EBR,(size_t)r*n,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dKey,key32,32,cudaMemcpyHostToDevice,s);
+    cudaMemcpyAsync(c->dTgt,target32,32,cudaMemcpyHostToDevice,s);
+    cudaMemsetAsync(c->dTr,0,c->ST*64,s);
+    int T=256;
+    k_noiseA<<<((size_t)m*k+T-1)/T,T,0,s>>>(c->dA,c->dEAL,c->dEAR,c->dAn,m,k,r);
+    k_noiseB<<<((size_t)k*n+T-1)/T,T,0,s>>>(c->dB,c->dEBL,c->dEBR,c->dBn,k,n,r);
+    dim3 grid(m/128,n/128);
+    k_mine<<<grid,256,0,s>>>(c->dAn,c->dBn,c->dTr,m,k,n);
+    k_pow_scan<<<1,1,0,s>>>(c->dTr,c->dKey,c->dTgt,m,n,128,16,16,c->dF,c->dAR,c->dBC,c->dTrOut);
+    cudaMemcpyAsync(found,c->dF,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(a_row,c->dAR,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(b_col,c->dBC,4,cudaMemcpyDeviceToHost,s);
+    cudaMemcpyAsync(tr_out,c->dTrOut,64,cudaMemcpyDeviceToHost,s);
+    cudaStreamSynchronize(s);
+    cudaError_t e=cudaGetLastError();
+    if (e!=cudaSuccess){ snprintf(g_err,sizeof(g_err),"ctx_run: %s",cudaGetErrorString(e)); return 4; }
+    return 0;
+}
+
+void prl_mine_ctx_destroy(void* h) {
+    PrlMineCtx* c = (PrlMineCtx*)h; if (!c) return;
+    cudaFree(c->dA); cudaFree(c->dB); cudaFree(c->dEAL); cudaFree(c->dEAR);
+    cudaFree(c->dEBL); cudaFree(c->dEBR); cudaFree(c->dAn); cudaFree(c->dBn);
+    cudaFree(c->dTr); cudaFree(c->dKey); cudaFree(c->dTgt); cudaFree(c->dTrOut);
+    cudaFree(c->dF); cudaFree(c->dAR); cudaFree(c->dBC); cudaStreamDestroy(c->stream); free(c);
 }
 } // extern "C"

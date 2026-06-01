@@ -1,9 +1,10 @@
 """ctypes wrapper for the FUSED tensor-core miner kernel (cuda/build/libprl_miner.so).
 
-This is the real mining hot loop on tensor cores (noised GEMM + transcript + on-device
-BLAKE3 PoW), validated bit-for-bit vs the golden vectors on the GPU
-(cuda/tests/validate_mine.py). Specialized for noise_rank=128; needs m%128==n%128==k%128==0.
-Linux/WSL only. Build: scripts/build_miner_wsl.sh.
+Uses the PERSISTENT CONTEXT API (prl_mine_ctx_*): device buffers + a CUDA stream are
+allocated once per shape and reused across every attempt, so the orchestrator loop runs
+near kernel speed instead of paying a cudaMalloc/cudaFree per attempt. The kernel itself
+(noised GEMM + transcript + on-device BLAKE3) is validated bit-for-bit vs the golden
+vectors on the GPU (cuda/tests/validate_mine.py). Linux/WSL only; noise_rank=128.
 """
 
 from __future__ import annotations
@@ -34,17 +35,31 @@ class MineCuda:
             raise MineCudaUnavailable(f"cannot load {_SO}: {exc}") from exc
         lib.prl_mine_last_error.restype = ctypes.c_char_p
         lib.prl_mine_device_count.restype = ctypes.c_int
-        lib.prl_mine_run.argtypes = [_i8, _i8, _i8, _i8, _i8, _i8,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                     _u8, _u8, _ip, _ip, _ip, _u32]
-        lib.prl_mine_run.restype = ctypes.c_int
+        lib.prl_mine_ctx_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        lib.prl_mine_ctx_create.restype = ctypes.c_void_p
+        lib.prl_mine_ctx_run.argtypes = [ctypes.c_void_p, _i8, _i8, _i8, _i8, _i8, _i8,
+                                         _u8, _u8, _ip, _ip, _ip, _u32]
+        lib.prl_mine_ctx_run.restype = ctypes.c_int
+        lib.prl_mine_ctx_destroy.argtypes = [ctypes.c_void_p]
         self._lib = lib
+        self._ctx: dict[tuple[int, int, int], int] = {}
         if lib.prl_mine_device_count() < 1:
             raise MineCudaUnavailable("no CUDA device visible to libprl_miner.so")
+
+    def _ctx_for(self, m: int, k: int, n: int) -> int:
+        key = (m, k, n)
+        h = self._ctx.get(key)
+        if h is None:
+            h = self._lib.prl_mine_ctx_create(m, k, n)
+            if not h:
+                raise RuntimeError(f"ctx_create failed: {self._lib.prl_mine_last_error().decode()}")
+            self._ctx[key] = h
+        return h
 
     def run(self, A, B, E_AL, E_AR, E_BL, E_BR, pow_key: bytes, pow_target: int):
         m, k = A.shape
         n = B.shape[1]
+        h = self._ctx_for(m, k, n)
         def p8(a):
             a = np.ascontiguousarray(a, dtype=np.int8)
             return a, a.ctypes.data_as(_i8)
@@ -54,10 +69,18 @@ class MineCuda:
         tgt = np.frombuffer(int(pow_target).to_bytes(32, "little"), dtype=np.uint8).copy()
         found = ctypes.c_int(0); a_row = ctypes.c_int(0); b_col = ctypes.c_int(0)
         tr = np.zeros(16, dtype=np.uint32)
-        rc = self._lib.prl_mine_run(pA, pB, pEAL, pEAR, pEBL, pEBR, m, k, n,
-                                    key.ctypes.data_as(_u8), tgt.ctypes.data_as(_u8),
-                                    ctypes.byref(found), ctypes.byref(a_row), ctypes.byref(b_col),
-                                    tr.ctypes.data_as(_u32))
+        rc = self._lib.prl_mine_ctx_run(h, pA, pB, pEAL, pEAR, pEBL, pEBR,
+                                        key.ctypes.data_as(_u8), tgt.ctypes.data_as(_u8),
+                                        ctypes.byref(found), ctypes.byref(a_row), ctypes.byref(b_col),
+                                        tr.ctypes.data_as(_u32))
         if rc != 0:
-            raise RuntimeError(f"prl_mine_run rc={rc}: {self._lib.prl_mine_last_error().decode()}")
+            raise RuntimeError(f"prl_mine_ctx_run rc={rc}: {self._lib.prl_mine_last_error().decode()}")
         return bool(found.value), a_row.value, b_col.value, tr
+
+    def __del__(self):
+        lib = getattr(self, "_lib", None)
+        for h in getattr(self, "_ctx", {}).values():
+            try:
+                lib.prl_mine_ctx_destroy(h)
+            except Exception:
+                pass

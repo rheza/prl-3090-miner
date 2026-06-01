@@ -37,6 +37,12 @@ def main() -> int:
     lib.prl_mine_bench.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                    ctypes.POINTER(ctypes.c_double)]
     lib.prl_mine_bench.restype = ctypes.c_int
+    lib.prl_mine_ctx_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.prl_mine_ctx_create.restype = ctypes.c_void_p
+    lib.prl_mine_ctx_run.argtypes = [ctypes.c_void_p, i8p, i8p, i8p, i8p, i8p, i8p,
+                                     u8p, u8p, ip, ip, ip, u32p]
+    lib.prl_mine_ctx_run.restype = ctypes.c_int
+    lib.prl_mine_ctx_destroy.argtypes = [ctypes.c_void_p]
     print(f"CUDA devices: {lib.prl_mine_device_count()}")
 
     def p8(a):
@@ -69,10 +75,22 @@ def main() -> int:
         if case["found_block"]:
             ok_loc = (a_row.value == case["A_row_indices"][0] and b_col.value == case["B_column_indices"][0])
             ok_tr = [hex(int(w)) for w in tr] == case["transcript_words"]
-        good = ok_found and ok_loc and ok_tr
+        # also verify the persistent-context path (what the orchestrator backend uses)
+        h = lib.prl_mine_ctx_create(m, k, n)
+        cf = ctypes.c_int(0); car = ctypes.c_int(0); cbc = ctypes.c_int(0)
+        ctr = np.zeros(16, dtype=np.uint32)
+        lib.prl_mine_ctx_run(h, pA, pB, pEAL, pEAR, pEBL, pEBR,
+                             key.ctypes.data_as(u8p), tgt.ctypes.data_as(u8p),
+                             ctypes.byref(cf), ctypes.byref(car), ctypes.byref(cbc),
+                             ctr.ctypes.data_as(u32p))
+        lib.prl_mine_ctx_destroy(h)
+        ctx_match = (bool(cf.value) == bool(found.value) and car.value == a_row.value
+                     and cbc.value == b_col.value and (not found.value or np.array_equal(ctr, tr)))
+        good = ok_found and ok_loc and ok_tr and ctx_match
         ok = ok and good
         print(f"  [{'PASS' if good else 'FAIL'}] {case['name']:26s} "
-              f"found={'=' if ok_found else 'X'} loc={'=' if ok_loc else 'X'} transcript={'=' if ok_tr else 'X'}")
+              f"found={'=' if ok_found else 'X'} loc={'=' if ok_loc else 'X'} "
+              f"transcript={'=' if ok_tr else 'X'} ctx={'=' if ctx_match else 'X'}")
 
     print("FUSED MINER throughput (k_mine: noised GEMM + per-chunk transcript, kernel-only):")
     for (m, k, n) in [(128, 256, 256), (1024, 1024, 1024), (2048, 2048, 2048)]:
