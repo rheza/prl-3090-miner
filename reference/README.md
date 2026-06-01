@@ -1,8 +1,15 @@
-# reference/ — CPU reference & golden vectors (Milestone 2)
+# reference/ - CPU reference and golden vectors
 
 A faithful, dependency-light (**numpy + blake3 only**, no torch/CUDA/Rust) port of the official Pearl
 PoUW reference, plus a deterministic golden-vector generator. This is the **correctness oracle** for the
-CUDA `sm_86` backend.
+CUDA `sm_86` work.
+
+Current project state:
+- Milestone 2 is done: this reference passes its test suite and produces six golden vectors.
+- Milestone 4 correctness is done for `cuda-naive`: the slow GPU backend passes these vectors
+  bit-for-bit, including transcript words and BLAKE3 checks.
+- Milestone 6 speed work is in progress: Ampere `mma.sync` tensor-core GEMM variants validate `C == A@B`
+  against the same vectors before being fused into the full noised/transcript mining path.
 
 | File | Purpose |
 |---|---|
@@ -16,6 +23,10 @@ CUDA `sm_86` backend.
 pip install numpy blake3 pytest
 python reference/generate_golden.py
 pytest -q reference/
+
+# In WSL/Ubuntu after building the naive CUDA backend:
+PYTHONPATH=. python reference/run_cuda_golden.py
+
 # In the Pearl dev env (WSL), prove equivalence to the official torch reference:
 python reference/verify_against_official.py
 ```
