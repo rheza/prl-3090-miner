@@ -17,7 +17,20 @@
 For RTX 3090 AlphaPool comparison, use the public AlphaMiner static difficulty guidance:
 `--password 'x;d=32768'`.
 
+`prl3090-miner` does not yet have a live AlphaPool submit mode. The observed AlphaPool Stratum shape and
+current blockers are tracked in `docs/alphapool-stratum.md`. Until real `PlainProof` assembly and the
+AlphaPool challenge response are implemented, use `scripts/probe_alphapool.py` only as a no-share
+connectivity/auth-shape probe.
+
 ```bash
+# Probe AlphaPool without submitting shares.
+python3 scripts/probe_alphapool.py \
+  --pool stratum+tcp://us2.alphapool.tech:5566 \
+  --address prl1pYOURPEARLADDRESS \
+  --worker prl3090 \
+  --password 'x;d=32768' \
+  --redact
+
 # Run a miner process for 10 minutes and compute pool-share TH/s from accepted shares.
 python3 scripts/protocol_benchmark.py \
   --duration 600 \

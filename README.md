@@ -36,6 +36,12 @@ The current runnable GPU backends still synthesize A/B matrices from the job hea
 harness tests. Production mining still needs the real model-sourced A/B tensors and real
 `py-pearl-mining` `PlainProof` assembly before a live gateway submit is meaningful.
 
+AlphaPool is a separate Stratum-Pearl path, not the same as the official gateway RPC. The current
+AlphaPool wire shape is documented in [`docs/alphapool-stratum.md`](docs/alphapool-stratum.md), but live
+pool submission is not implemented yet because AlphaPool requires an undocumented
+`pearl.challenge_response` handshake and a real base64 `PlainProof` payload. The current harness proof
+bytes will not be accepted by AlphaPool.
+
 ## Milestone Snapshot
 
 | Milestone | Status | What it means |
@@ -60,6 +66,8 @@ The repo currently represents a working **RTX 3090 PoUW kernel prototype plus mi
 - `miner/runtime.py` implements the cold path: job polling, new-tip detection, stale-result dropping,
   gateway submission, metrics, and thermal/invalid-proof safety checks.
 - `miner/gateway_client.py` speaks the gateway miner RPC: `getMiningInfo` and `submitPlainProof`.
+- `miner/alphapool_client.py` records the clean-room AlphaPool Stratum submit shape and job parser for
+  the future pool mode. It is not a complete pool miner yet.
 - `CpuBackend` and `CudaNaiveBackend` are correctness/orchestration harnesses.
 - `CudaMineBackend` is the current fast path. It loads `cuda/build/libprl_miner.so` through
   `miner/cuda_mine.py`, keeps CUDA buffers and a stream alive through `prl_mine_ctx_*`, derives noise
@@ -85,7 +93,8 @@ Latest local verification on the visible RTX 3090 (`driver 591.86`, `24 GB`) sho
 Do **not** read those as Pearl protocol hashrate. A real TH/s number requires accepted proofs against a
 live node/gateway or accepted pool shares over a sustained run, with stale and reject rates included.
 For pool-side benchmarking, use `scripts/protocol_benchmark.py`; for a clean-room AlphaMiner baseline,
-use `scripts/compare_alphaminer.sh` with static diff `x;d=32768` on RTX 3090.
+use `scripts/compare_alphaminer.sh` with static diff `x;d=32768` on RTX 3090. To probe the AlphaPool
+endpoint without submitting shares, use `scripts/probe_alphapool.py`.
 
 ## Repository Layout
 

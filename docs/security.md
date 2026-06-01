@@ -33,7 +33,8 @@
 - Publish SHA-256 checksums for any binary artifacts; prefer reproducible builds.
 - This project uses the official Pearl protocol as a **reference only**. It does not bundle, patch, or
   reverse engineer AlphaMiner or any private binary (PRD §5, §25). `scripts/compare_alphaminer.sh` runs
-  AlphaMiner purely as an external black box and inspects only its self-reported hashrate.
+  AlphaMiner purely as an external black box and inspects only its self-reported hashrate. AlphaPool
+  protocol notes are limited to our own line-delimited JSON traffic; no private binary internals are used.
 
 ## Authorization
 Mining on hardware you own, against your own node/pool, is the intended use. Do not point the miner at
