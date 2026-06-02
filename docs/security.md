@@ -31,10 +31,28 @@
 
 ## Releases (PRD §26)
 - Publish SHA-256 checksums for any binary artifacts; prefer reproducible builds.
-- This project uses the official Pearl protocol as a **reference only**. It does not bundle, patch, or
-  reverse engineer AlphaMiner or any private binary (PRD §5, §25). `scripts/compare_alphaminer.sh` runs
+- This project uses the official Pearl protocol as a **reference only**. It does not bundle, patch, copy,
+  or decompile AlphaMiner or any private binary (PRD §5, §25). `scripts/compare_alphaminer.sh` runs
   AlphaMiner purely as an external black box and inspects only its self-reported hashrate. AlphaPool
-  protocol notes are limited to our own line-delimited JSON traffic; no private binary internals are used.
+  protocol notes are limited to our own line-delimited JSON traffic, public documentation, and
+  operator-provided information; no private binary internals are used.
+
+## Interoperability research (PRD §5, §24, §25)
+The project may add pool support through legitimate interoperability work:
+
+- allowed: public protocol documentation, official Pearl source, our own line-delimited JSON traffic,
+  our own miner's behavior, pool-visible accepted/rejected share results, and written operator-provided
+  challenge/auth specifications;
+- allowed: black-box compatibility tests that connect using our own public payout address and ordinary
+  miner credentials, provided they do not submit malformed traffic at scale or evade pool limits;
+- allowed: implementing `pearl.challenge_response` only when the algorithm is public, independently
+  specified by the pool/operator, or otherwise authorized for this project;
+- not allowed: extracting secrets, credentials, or challenge algorithms from private binaries without
+  authorization, copying proprietary code, patching another miner, or bypassing anti-DDoS/access-control
+  checks.
+
+Any private-binary inspection requires explicit written permission from the rights holder/operator and a
+separate design note documenting scope, artifacts inspected, and why the result is safe to include.
 
 ## Authorization
 Mining on hardware you own, against your own node/pool, is the intended use. Do not point the miner at

@@ -38,7 +38,13 @@ and the eligible-warps stall reasons. Optimize the kernel with the worst SOL fir
 - M8: 80–110 TH/s depending on preset, stable 24 h, benchmarked vs AlphaMiner black box.
 
 ## Clean-room parity rule
-AlphaMiner may be used only as a black-box benchmark. Record its reported TH/s, accepted shares, rejects,
-stales, watts, driver, clocks, pool region, worker name, and static difficulty. Do not decompile,
-disassemble, patch, trace proprietary internals, or copy behavior from private binaries. Use public Pearl
-source, public AlphaMiner documentation, pool-visible shares, and Nsight aggregate counters only.
+AlphaMiner may be used only as a black-box benchmark unless the rights holder/operator gives explicit
+written permission for a narrower interoperability review. Record its reported TH/s, accepted shares,
+rejects, stales, watts, driver, clocks, pool region, worker name, and static difficulty. Do not
+decompile, disassemble, patch, trace proprietary internals, or copy behavior from private binaries without
+that authorization. Use public Pearl source, public AlphaMiner documentation, pool-visible shares, our own
+packet captures, operator-provided protocol details, and Nsight aggregate counters.
+
+Permissioned AlphaPool interoperability is a separate milestone from performance parity: first get an
+authorized `pearl.challenge_response` implementation or operator-provided auth path, then submit real
+`PlainProof` shares, then measure pool-visible TH/s over a sustained run.

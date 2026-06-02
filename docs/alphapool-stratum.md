@@ -13,8 +13,8 @@ proven on the official Pearl side: `fast_mine.py` can hand a GPU-found winner to
 
 AlphaPool submission is still not available because the connection is blocked before
 `mining.authorize` by AlphaPool's undocumented `pearl.challenge_response` handshake. This project does
-not reverse engineer private binaries or bypass that gate. Once an authorized/public challenge solver is
-available, the submit envelope is:
+not reverse engineer private binaries or bypass that gate without explicit operator/rights-holder
+authorization. Once an authorized/public challenge solver is available, the submit envelope is:
 
 ```json
 {"id": 5, "method": "mining.submit", "params": ["prl1p...worker", "<job_id>", "<base64_plain_proof>"]}
@@ -126,6 +126,8 @@ To make `prl3090-miner` submit real AlphaPool shares:
 1. Implement the `pearl.challenge_response` solver from a public specification, an operator-provided
    authorization path, or another legitimate source that does not require bypassing AlphaPool access
    control.
-2. Add an AlphaPool mode that maps `pearl.set_mining_params` / `mining.notify` into GPU work, submits
+2. Document the authorization source in `docs/security.md` or a dedicated design note before shipping the
+   solver.
+3. Add an AlphaPool mode that maps `pearl.set_mining_params` / `mining.notify` into GPU work, submits
    `mining.submit`, and tracks accepted/rejected/stale shares for protocol TH/s.
-3. Run at least 1 hour on the same pool region/static difficulty before comparing to AlphaMiner.
+4. Run at least 1 hour on the same pool region/static difficulty before comparing to AlphaMiner.
