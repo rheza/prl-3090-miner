@@ -157,16 +157,33 @@ def live(host, port, tls, address, worker, natt, minutes) -> int:
 
     if pump(8.0) == "closed":
         return 1
-    t0 = time.time(); deadline = t0 + minutes * 60; tried = 0; shares = 0
+    t0 = time.time(); deadline = t0 + minutes * 60
+    tried = 0; submitted = 0; accepted = 0
+
+    def report(tag):
+        el = max(1e-9, time.time() - t0)
+        aps = tried / el
+        ths = aps * (m * k * n * 2) / 1e12            # "TH/s" ~= achieved int8 TOPS (attempt = m*k*n MAC)
+        # Calibrated to a real datapoint: RTX 5090 @ ~300 TH/s ~= $17.19/day (Tom's Hardware, 2026),
+        # LuckyPool fee 1%. Earnings track hashrate linearly; PRL price moves, so this is a rough estimate.
+        usd_day = (ths / 300.0) * 17.19 * 0.99
+        usd = usd_day * (el / 86400.0)
+        print(f"[report:{tag}] elapsed={el/60:.1f}min attempts={tried} rate={aps:,.0f}/s (~{ths:.1f} TH/s) "
+              f"| shares submitted={submitted} accepted={accepted} "
+              f"| est. earnings so far ~${usd:.4f} (~${usd_day:.2f}/day @ this rate)")
+
+    last_report = t0
     while time.time() < deadline:
         if pump(0.02) == "closed":
-            return 1
+            report("final"); return 1
         if cur["header"] is None:
             time.sleep(0.2); continue
         job_id, header, tle = cur["job_id"], cur["header"], cur["tle"]
         An, Bn, keys, atts = build_batch(rng, ng, CommitmentHasher, tt, header, mcfg, m, k, n, natt)
         tried += natt
         fa, arow, bcol, _ = gpu_search(lib, An, Bn, keys, tle, m, k, n, natt)
+        if time.time() - last_report > 60:
+            report("tick"); last_report = time.time()
         if job_id != cur["job_id"]:            # job rolled over mid-batch -> stale, drop it
             continue
         if fa < 0:
@@ -178,17 +195,20 @@ def live(host, port, tls, address, worker, natt, minutes) -> int:
             print("[luckypool] GPU winner not confirmed (target scaling?) — skipping"); continue
         ob = gemm.get_opened_block_info()
         b64 = create_proof(ob, header).to_base64()
-        shares += 1
-        rate = tried / max(1e-9, time.time() - t0)
-        print(f"[luckypool] SHARE #{shares} job={job_id} after {tried} attempts ({rate/1e3:.1f}k/s); "
-              f"proof {len(b64)}B -> mining.submit")
+        submitted += 1
+        print(f"[luckypool] SHARE job={job_id} after {tried} attempts; proof {len(b64)}B -> mining.submit")
         sid = c.send("mining.submit", {"wallet": address, "worker": worker, "job_id": job_id, "proof": b64})
         for msg in c.messages(time.time() + 6):
             print(f"[luckypool] submit <- {json.dumps(msg)[:220]}")
+            blob = json.dumps(msg).lower()
+            if msg.get("result") is True or "accept" in blob:
+                accepted += 1
             if msg.get("id") == sid or "result" in msg or "error" in msg:
                 break
     c.close()
-    print(f"[luckypool] done; searched {tried} attempts, submitted {shares} shares")
+    report("final")
+    print(f"[luckypool] === 12h-style summary === attempts={tried} submitted={submitted} accepted={accepted}")
+    print("[luckypool] (authoritative shares/earnings: your LuckyPool dashboard for this address)")
     return 0
 
 
