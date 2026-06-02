@@ -128,6 +128,16 @@ already validates).
     Pearl's open protocol**. AlphaPool's gate is **proprietary/undocumented**, obtainable only by
     reverse-engineering the closed AlphaMiner — which this project does not do. Shares are correct;
     legitimate delivery is solo-to-`pearld` (works) or a pool that publishes its auth.
+  - ✅ **LuckyPool — an OPEN pool, wired (offline-verified).** Probed every pool with a public-protocol
+    client (`miner/pool_client.py`, no bypass): AlphaPool/Akoya = proprietary challenge gate;
+    pearlpool.io (TLS 34334) drops the standard handshake; **LuckyPool (`pearl-eu2.luckypool.io:3360`)
+    has NO gate** — clean JSON-RPC, schema revealed by its own errors: `mining.authorize {"wallet":<addr>}`
+    → `result:true`, then `mining.notify {header,height,job_id,target}`. Built **`miner/luckypool_miner.py`**:
+    authorize → job → official `MiningJob.adjust_target` → GPU `prl_mine2_search` → official `create_proof`
+    → `mining.submit`. `--dry-run` validates the full job→search→confirm→PlainProof path on LuckyPool's
+    **real captured header** (PASS, 24,812 B proof). Remaining: a live run from a non-rate-limited IP
+    (probing rate-limited this host) to land shares + confirm the `mining.submit` field names. No RE, no
+    bypass — LuckyPool's dialect is what the pool itself returns.
 
 ## Performance targets (PRD §12.4) — assessment
 Minimum 20 · Beta 50 · Competitive 80 · Close-to-the-bone 100–110 TH/s.
