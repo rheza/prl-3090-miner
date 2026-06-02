@@ -70,8 +70,13 @@ already validates).
     rose from 1 block/SM; **still passes `tests/golden_protocol/` on the GPU** (found/loc/transcript)
     and the 16×16 path is unregressed. Throughput **~22–27 → ~38–39 TOPS** (38.4 @1024³, 39.4 @2048³)
     — the protocol-*valid* kernel now matches the old protocol-*invalid* 44-TOPS `k_mine`, but correct.
-  - 🟧 (b2) next: `ldmatrix`(.x2.trans for B)+SMEM swizzle — the B operand is still built from scalar
-    byte loads (the transpose), the clear remaining bottleneck; toward ~80–150 TOPS.
+  - ✅ (b2) **DONE** — B-smem bank-conflict fix. The B row-stride was 128 B = exactly 32 banks, so the
+    4 k-strided byte-loads of each fragment collapsed onto 2 banks (**16-way conflict**). Padding the
+    stride to 144 B (16-aligned, off the 32-word period) breaks it. Golden still exact, no regression.
+    Throughput **~38–39 → ~55 TOPS** (55.2 @1024³, 55.8 @2048³) — the protocol-*valid* kernel now
+    *exceeds* the old protocol-*invalid* 44-TOPS `k_mine`. ptxas: 120 regs, 17 KB smem → 2 blocks/SM.
+  - 🟧 (b3) next: vectorize the B load (eliminate the sub-word/transpose byte-loads via a k-contiguous
+    smem layout or `ldmatrix`) — residual ~8-way conflict; toward ~70–100 TOPS.
   - ⬜ (c) wire GPU `prl_mine2_run` → `create_proof` → submit (fast + valid).
   - ⬜ (d) measure sustained accepted-block rate + watts.
 
