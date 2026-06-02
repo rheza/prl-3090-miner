@@ -58,9 +58,16 @@ already validates).
 - **Protocol oracle ready:** `reference/generate_protocol_golden.py` regenerates golden at the real 2×64
   config and **cross-checks the NumPy reference against the official torch NoisyGemm — they match**
   (`tests/golden_protocol/`). This is the correctness target for the GPU rework.
-- **Remaining real plan (multi-step, golden-gated, honest numbers only):** (a) rework `k_mine` inner-hash/
-  transcript to 2×64 + validate vs `tests/golden_protocol/`; (b) `ldmatrix`+swizzle optimize (~3–4×);
-  (c) wire GPU-search → `create_proof` → submit; (d) measure sustained accepted-block rate + watts.
+- **Plan progress (golden-gated, honest numbers only):**
+  - ✅ (a) **DONE** — `cuda/src/mine_sm86.cu` `k_mine2`: protocol-valid 2×64 kernel (tensor-core GEMM +
+    materialize-to-SMEM + 2×64 hashing). **Passes `tests/golden_protocol/` on the GPU** (found/indices/
+    transcript words match the official NoisyGemm). Throughput **~22–27 TOPS** (lower than the old
+    protocol-*invalid* 16×16 `k_mine`'s 44 TOPS — the 64 KB materialize caps occupancy at 1 block/SM).
+    Validator: `cuda/tests/validate_mine2.py`.
+  - ⬜ (b) optimize `k_mine2`: register-resident 2×64 hashing (drop the 64 KB materialize → raise
+    occupancy) + `ldmatrix`+swizzle, toward ~150–200 TOPS.
+  - ⬜ (c) wire GPU `prl_mine2_run` → `create_proof` → submit (fast + valid).
+  - ⬜ (d) measure sustained accepted-block rate + watts.
 
 ## Performance targets (PRD §12.4) — correctness done; speed is the open work
 Minimum 20 TH/s · Beta 50 TH/s · Competitive 80 TH/s · Close-to-the-bone 100–110 TH/s. The naive

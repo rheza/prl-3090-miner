@@ -270,6 +270,74 @@ __global__ void k_transpose(const int8_t* U, int8_t* T, int rows, int cols) {  /
     T[(idx % cols) * rows + (idx / cols)] = U[idx];
 }
 
+// PROTOCOL-VALID fused miner: real 2x64 hash tile (rows_pattern [0,8], 64-col), rank 128,
+// 128x128 output tile. Tensor-core GEMM (cp.async) then materialize the cumulative
+// accumulator to SMEM each 128-K chunk and hash the 2x64 tiles from a natural [row][col]
+// layout (correct-by-construction; matches the official NoisyGemm / tests/golden_protocol).
+__global__ void k_mine2(const int8_t* An, const int8_t* Bn, uint32_t* transcripts,
+                        int m, int k, int n) {
+    __shared__ int8_t As[2][128 * 32];
+    __shared__ int8_t Bs[2][32 * 128];
+    extern __shared__ int32_t Cs[];                 // 128*128 int32 dynamic (64 KB)
+    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    int wr = wid >> 1, wc = wid & 1, g = lane >> 2, t = lane & 3;
+    int br = blockIdx.x * 128, bc = blockIdx.y * 128, nk = k >> 5, ST_cols = n >> 6;  // n/64
+    int acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 8; j++) for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
+#define LOAD2(s, koff) do { int ar = tid >> 1, ah = tid & 1; \
+        cp_async16(&As[s][ar*32 + ah*16], &An[IDX(br+ar, (koff)+ah*16, k)]); \
+        int br_ = tid >> 3, bp = tid & 7; \
+        cp_async16(&Bs[s][br_*128 + bp*16], &Bn[IDX((koff)+br_, bc+bp*16, n)]); } while (0)
+    LOAD2(0, 0); cp_commit();
+    for (int ks = 0; ks < nk; ks++) {
+        int cur = ks & 1;
+        if (ks + 1 < nk) { LOAD2((ks + 1) & 1, (ks + 1) * 32); cp_commit(); cp_wait1(); } else cp_wait0();
+        __syncthreads();
+        const int8_t* Bb = &Bs[cur][0];
+        uint32_t bf0[8], bf1[8];
+        #pragma unroll
+        for (int ncol = 0; ncol < 8; ncol++) { int bcol = wc*64 + ncol*8 + g;
+            bf0[ncol] = pk(Bb[(t*4+0)*128+bcol], Bb[(t*4+1)*128+bcol], Bb[(t*4+2)*128+bcol], Bb[(t*4+3)*128+bcol]);
+            bf1[ncol] = pk(Bb[(t*4+16)*128+bcol], Bb[(t*4+17)*128+bcol], Bb[(t*4+18)*128+bcol], Bb[(t*4+19)*128+bcol]); }
+        #pragma unroll
+        for (int mrow = 0; mrow < 2; mrow++) {
+            int arow = wr*32 + mrow*16;
+            const int8_t* Ar0 = &As[cur][(arow+g)*32]; const int8_t* Ar8 = &As[cur][(arow+g+8)*32];
+            uint32_t a0 = *(const uint32_t*)(Ar0+t*4), a1 = *(const uint32_t*)(Ar8+t*4);
+            uint32_t a2 = *(const uint32_t*)(Ar0+t*4+16), a3 = *(const uint32_t*)(Ar8+t*4+16);
+            #pragma unroll
+            for (int ncol = 0; ncol < 8; ncol++) { int* c = acc[mrow][ncol];
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                  : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
+                  : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(bf0[ncol]),"r"(bf1[ncol])); }
+        }
+        __syncthreads();
+        if (((ks + 1) & 3) == 0) {                   // end of a 128-wide K chunk
+            int slot = (((ks + 1) >> 2) - 1) & 15;
+            #pragma unroll
+            for (int mrow = 0; mrow < 2; mrow++) { int rb = wr*32 + mrow*16;
+                #pragma unroll
+                for (int ncol = 0; ncol < 8; ncol++) { int cb = wc*64 + ncol*8; int* c = acc[mrow][ncol];
+                    Cs[(rb+g)*128 + cb+2*t]     = c[0]; Cs[(rb+g)*128 + cb+2*t+1]   = c[1];
+                    Cs[(rb+g+8)*128 + cb+2*t]   = c[2]; Cs[(rb+g+8)*128 + cb+2*t+1] = c[3]; }
+            }
+            __syncthreads();
+            for (int st = tid; st < 128; st += 256) {     // 128 (=64x2) 2x64 sub-tiles
+                int sr = st >> 1, sc = st & 1, r0 = sr*2, c0 = sc*64; uint32_t h = 0;
+                #pragma unroll
+                for (int rr = 0; rr < 2; rr++) { int base = (r0+rr)*128 + c0;
+                    for (int cc = 0; cc < 64; cc++) h ^= (uint32_t)Cs[base+cc]; }
+                int gsr = (br >> 1) + sr, gsc = (bc >> 6) + sc;
+                uint32_t* tr = &transcripts[((size_t)gsr*ST_cols + gsc)*16 + slot];
+                *tr = ((*tr << 13) | (*tr >> 19)) ^ h;
+            }
+            __syncthreads();
+        }
+    }
+#undef LOAD2
+}
+
 // ---------- host C ABI ----------
 static char g_err[256]={0};
 #define CK(call) do{ cudaError_t e_=(call); if(e_!=cudaSuccess){ \
@@ -327,6 +395,60 @@ int prl_mine_bench(int m,int k,int n,int iters,double* out_ms){
     k_mine<<<grid,256>>>(dAn,dBn,dTr,m,k,n); CK(cudaDeviceSynchronize());
     cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e); cudaEventRecord(s);
     for(int i=0;i<iters;i++) k_mine<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
+    cudaEventRecord(e); CK(cudaEventSynchronize(e));
+    float ms=0; cudaEventElapsedTime(&ms,s,e); *out_ms=(double)ms/iters;
+    cudaEventDestroy(s);cudaEventDestroy(e); cudaFree(dAn);cudaFree(dBn);cudaFree(dTr); return 0;
+}
+
+// PROTOCOL-VALID full mine at the real 2x64 hash tile (validated vs tests/golden_protocol).
+int prl_mine2_run(const int8_t* A,const int8_t* B,const int8_t* EAL,const int8_t* EAR,
+                  const int8_t* EBL,const int8_t* EBR,int m,int k,int n,
+                  const uint8_t* key32,const uint8_t* target32,
+                  int* found,int* a_row,int* b_col,uint32_t* tr_out){
+    const int r=128, TH=2, TW=64;
+    if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need m%%128==n%%128==k%%128==0"); return 2; }
+    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn; uint32_t *dTr,*dKey,*dTgt,*dTrOut; int *dF,*dAR,*dBC,*dBest;
+    size_t ST=(size_t)(m/TH)*(n/TW);
+    CK(cudaMalloc(&dA,(size_t)m*k));CK(cudaMalloc(&dB,(size_t)k*n));
+    CK(cudaMalloc(&dEAL,(size_t)m*r));CK(cudaMalloc(&dEAR,(size_t)r*k));
+    CK(cudaMalloc(&dEBL,(size_t)k*r));CK(cudaMalloc(&dEBR,(size_t)r*n));
+    CK(cudaMalloc(&dAn,(size_t)m*k));CK(cudaMalloc(&dBn,(size_t)k*n));
+    CK(cudaMalloc(&dTr,ST*16*4));CK(cudaMemset(dTr,0,ST*16*4));
+    CK(cudaMalloc(&dKey,32));CK(cudaMalloc(&dTgt,32));CK(cudaMalloc(&dTrOut,64));
+    CK(cudaMalloc(&dF,4));CK(cudaMalloc(&dAR,4));CK(cudaMalloc(&dBC,4));CK(cudaMalloc(&dBest,4));
+    CK(cudaMemcpy(dA,A,(size_t)m*k,cudaMemcpyHostToDevice));CK(cudaMemcpy(dB,B,(size_t)k*n,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dEAL,EAL,(size_t)m*r,cudaMemcpyHostToDevice));CK(cudaMemcpy(dEAR,EAR,(size_t)r*k,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dEBL,EBL,(size_t)k*r,cudaMemcpyHostToDevice));CK(cudaMemcpy(dEBR,EBR,(size_t)r*n,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dKey,key32,32,cudaMemcpyHostToDevice));CK(cudaMemcpy(dTgt,target32,32,cudaMemcpyHostToDevice));
+    int T=256, smem=128*128*4;          // 64KB dynamic SMEM for the materialized accumulator
+    cudaFuncSetAttribute(k_mine2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    k_noiseA<<<((size_t)m*k+T-1)/T,T>>>(dA,dEAL,dEAR,dAn,m,k,r);
+    k_noiseB<<<((size_t)k*n+T-1)/T,T>>>(dB,dEBL,dEBR,dBn,k,n,r);
+    dim3 grid(m/128,n/128);
+    k_mine2<<<grid,256,smem>>>(dAn,dBn,dTr,m,k,n);
+    CK(cudaMemset(dBest,0x7f,4));
+    int total_tiles=(m/128)*(n/128)*(128/TH)*(128/TW);
+    k_pow_scan_find<<<(total_tiles+T-1)/T,T>>>(dTr,dKey,dTgt,m,n,r,TH,TW,dBest);
+    k_pow_scan_emit<<<1,1>>>(dTr,m,n,r,TH,TW,dBest,dF,dAR,dBC,dTrOut);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(found,dF,4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(a_row,dAR,4,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(b_col,dBC,4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(tr_out,dTrOut,64,cudaMemcpyDeviceToHost));
+    cudaFree(dA);cudaFree(dB);cudaFree(dEAL);cudaFree(dEAR);cudaFree(dEBL);cudaFree(dEBR);
+    cudaFree(dAn);cudaFree(dBn);cudaFree(dTr);cudaFree(dKey);cudaFree(dTgt);cudaFree(dTrOut);
+    cudaFree(dF);cudaFree(dAR);cudaFree(dBC);cudaFree(dBest);
+    return 0;
+}
+
+int prl_mine2_bench(int m,int k,int n,int iters,double* out_ms){
+    if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need mod128"); return 2; }
+    int8_t *dAn,*dBn; uint32_t* dTr; size_t ST=(size_t)(m/2)*(n/64);
+    CK(cudaMalloc(&dAn,(size_t)m*k));CK(cudaMalloc(&dBn,(size_t)k*n));CK(cudaMalloc(&dTr,ST*16*4));
+    CK(cudaMemset(dAn,1,(size_t)m*k));CK(cudaMemset(dBn,1,(size_t)k*n));CK(cudaMemset(dTr,0,ST*16*4));
+    int smem=128*128*4; cudaFuncSetAttribute(k_mine2,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
+    dim3 grid(m/128,n/128);
+    k_mine2<<<grid,256,smem>>>(dAn,dBn,dTr,m,k,n); CK(cudaDeviceSynchronize());
+    cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e); cudaEventRecord(s);
+    for(int i=0;i<iters;i++) k_mine2<<<grid,256,smem>>>(dAn,dBn,dTr,m,k,n);
     cudaEventRecord(e); CK(cudaEventSynchronize(e));
     float ms=0; cudaEventElapsedTime(&ms,s,e); *out_ms=(double)ms/iters;
     cudaEventDestroy(s);cudaEventDestroy(e); cudaFree(dAn);cudaFree(dBn);cudaFree(dTr); return 0;
