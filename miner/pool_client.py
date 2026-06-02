@@ -135,19 +135,27 @@ def probe(host: str, port: int, tls: bool, address: str, worker: str, seconds: f
     # Clean single-shot handshake for the LuckyPool-style open dialect (no noisy multi-phase probing,
     # to respect the pool's server): one mining.authorize with the wallet object, then listen for a job.
     if wallet_only:
-        print("[probe] wallet-mode: single mining.authorize {wallet,worker,agent}, then listen for a job")
+        print("[probe] wallet-mode: authorize {wallet,worker,agent}; capturing the full job schema")
         aid = c.send("mining.authorize", {"wallet": address, "worker": worker, "agent": "prl-3090-miner/1.0"})
-        obs = _collect(c, time.time() + seconds, {aid})
+        deadline = time.time() + seconds
+        job = None
+        for msg in c.messages(deadline):
+            if "_closed" in msg or "_error" in msg:
+                print(f"[probe] <- {msg}")
+                break
+            print(f"[probe] <- {json.dumps(msg)}")               # full message, untruncated
+            if msg.get("method") in ("mining.notify", "job"):
+                job = msg.get("params")
+            # keep listening to also capture mining.set_difficulty / set_target etc.
         c.close()
         print("\n[probe] ==== verdict ====")
-        if obs["job"] is not None:
-            print("  OPEN PROTOCOL ✓ — LuckyPool issued a JOB after wallet authorize (no secret gate).")
+        if job is not None:
+            if isinstance(job, dict):
+                print(f"  OPEN PROTOCOL ✓ — job keys: {list(job.keys())}")
+            else:
+                print(f"  OPEN PROTOCOL ✓ — job is an array of {len(job)} fields")
             return 0
-        if obs["challenge"]:
-            print("  unexpected challenge signal — stopping (no bypass).")
-            return 1
-        print("  No job yet (auth result/schema above). Re-run from your own IP if rate-limited here;")
-        print("  the dialect is open (mining.authorize {wallet:...}) — next step is its job/submit schema.")
+        print("  No job captured (auth result above). If rate-limited here, re-run from your own IP.")
         return 3
 
     # Phase 1: classic Stratum v1 (array params).
