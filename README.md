@@ -166,7 +166,7 @@ loop is still a remaining integration milestone.
 
 - Never asks for or stores a seed phrase or private key: only the **public** Taproot mining address and
   local RPC credentials are needed.
-- Does not reverse engineer, decompile, or copy AlphaMiner; it is only a black-box benchmark target.
+
 - Applies no overclock or power change unless explicitly enabled; temperature limits are enforced by the
   miner runtime.
 - No hidden process, no remote telemetry by default, visible logs always.

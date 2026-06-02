@@ -158,6 +158,22 @@ def probe(host: str, port: int, tls: bool, address: str, worker: str, seconds: f
             for k in ("job", "challenge", "closed"):
                 obs[k] = obs2[k] if (obs2[k] not in (None, False) or obs[k] in (None, False)) else obs[k]
             obs["authorized"] = obs.get("authorized") or obs2.get("authorized")
+
+    # Phase 3: mining.authorize with OBJECT params (LuckyPool-style: method recognized, wants an
+    # object). Try an empty object first (its error usually names the required field), then shapes.
+    if obs["job"] is None and not obs["challenge"] and not obs["closed"]:
+        print("[probe] phase 3: mining.authorize with object params (schema probe)")
+        for shape in ({"wallet": address, "worker": worker, "agent": "prl-3090-miner/1.0"},
+                      {"wallet": address, "worker": worker}, {"wallet": address},
+                      {"wallet": user}, {"login": user, "pass": "x"}):
+            aid = c.send("mining.authorize", shape)
+            o3 = _collect(c, time.time() + 3.0, {aid})
+            for k in ("job", "challenge", "closed"):
+                if o3[k] not in (None, False):
+                    obs[k] = o3[k]
+            obs["authorized"] = obs.get("authorized") or o3.get("authorized")
+            if obs["job"] is not None or obs["challenge"] or obs["closed"]:
+                break
     c.close()
 
     print("\n[probe] ==== verdict ====")
