@@ -75,10 +75,20 @@ already validates).
     stride to 144 B (16-aligned, off the 32-word period) breaks it. Golden still exact, no regression.
     Throughput **~38–39 → ~55 TOPS** (55.2 @1024³, 55.8 @2048³) — the protocol-*valid* kernel now
     *exceeds* the old protocol-*invalid* 44-TOPS `k_mine`. ptxas: 120 regs, 17 KB smem → 2 blocks/SM.
-  - 🟧 (b3) next: vectorize the B load (eliminate the sub-word/transpose byte-loads via a k-contiguous
-    smem layout or `ldmatrix`) — residual ~8-way conflict; toward ~70–100 TOPS.
-  - ⬜ (c) wire GPU `prl_mine2_run` → `create_proof` → submit (fast + valid).
-  - ⬜ (d) measure sustained accepted-block rate + watts.
+  - ◻️ (b3) B-load transpose to k-contiguous smem (one conflict-free `uint32` per fragment): tried,
+    **reverted**. It needs an extra per-chunk `__syncthreads()`; net +8% @2048³ but **−13% @1024³**,
+    and the *real* attempt shape (below) is even shorter-K, where the sync overhead dominates. The
+    144-byte padding (b2) is the robust win. `ldmatrix` (Ampere int8 = .b16-only, interleaved layout)
+    is the remaining single-GEMM lever but high-risk for ~marginal gain at this occupancy.
+  - ✅ (b4) **DONE — batched mining throughput (the metric that actually matters).** The real
+    per-attempt GEMM is **128×256×256** (`simnet_solo.py`: `m=128,n=256,k=256`) = grid (1,2) = **2
+    blocks ≈ 2.4 % of the 82-SM GPU**, so a single attempt can never be fast (measured **1.2 TOPS**).
+    Added `blockIdx.z` batching to `k_mine2` (one independent attempt per z-slice; a no-op for the
+    single-attempt golden path, still bit-exact) + `prl_mine2_bench_batched`. Filling the GPU with
+    NATT concurrent attempts: **peak ~72.9 TOPS / ~4.35 M noised-GEMM+hash attempts/s at NATT=256**
+    (vs 0.073 M/s at NATT=1 — a ~60× fill factor). Sweep in `cuda/tests/validate_mine2.py`.
+  - ⬜ (c) wire batched GPU `k_mine2` → per-attempt GPU noise → `create_proof` → submit (fast + valid).
+  - ⬜ (d) measure sustained accepted-block rate + watts end-to-end (noise gen included).
 
 ## Performance targets (PRD §12.4) — correctness done; speed is the open work
 Minimum 20 TH/s · Beta 50 TH/s · Competitive 80 TH/s · Close-to-the-bone 100–110 TH/s. The naive

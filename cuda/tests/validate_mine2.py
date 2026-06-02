@@ -29,6 +29,8 @@ def main() -> int:
     lib.prl_mine2_run.restype = ctypes.c_int
     lib.prl_mine2_bench.argtypes = [ctypes.c_int]*4 + [ctypes.POINTER(ctypes.c_double)]
     lib.prl_mine2_bench.restype = ctypes.c_int
+    lib.prl_mine2_bench_batched.argtypes = [ctypes.c_int]*5 + [ctypes.POINTER(ctypes.c_double)]
+    lib.prl_mine2_bench_batched.restype = ctypes.c_int
 
     def p8(a):
         a = np.ascontiguousarray(a, dtype=np.int8); return a, a.ctypes.data_as(i8p)
@@ -65,6 +67,19 @@ def main() -> int:
             print(f"  {m}x{k}x{n}: {ms.value:.3f} ms  {g:.1f} GMAC/s  ({2*g/1e3:.2f} TOPS)")
         else:
             print(f"  {m}x{k}x{n}: {lib.prl_mine_last_error().decode()}")
+
+    # The mining-relevant metric: a real attempt is 128x256x256 = grid (1,2) = 2 blocks (~2.4%
+    # of the GPU), so throughput == batched attempts/sec. Sweep NATT to find where the GPU fills.
+    m, k, n = 128, 256, 256
+    print(f"BATCHED MINING THROUGHPUT (real per-attempt shape {m}x{k}x{n}, noised GEMM + 2x64 hash):")
+    for natt in [1, 16, 64, 128, 256, 512, 1024]:
+        ms = ctypes.c_double(0)
+        if lib.prl_mine2_bench_batched(m, k, n, natt, 50, ctypes.byref(ms)) == 0:
+            aps = natt / (ms.value / 1e3)
+            tops = 2.0 * natt * m * k * n / (ms.value / 1e3) / 1e12
+            print(f"  natt={natt:5d}: {ms.value:.4f} ms/iter  {aps/1e6:7.3f} M attempts/s  ({tops:6.2f} TOPS)")
+        else:
+            print(f"  natt={natt}: {lib.prl_mine_last_error().decode()}")
     print("RESULT:", "ALL PASS" if ok else "FAILURES")
     return 0 if ok else 1
 

@@ -283,6 +283,8 @@ __global__ void k_mine2(const int8_t* An, const int8_t* Bn, uint32_t* transcript
     int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;   // breaks the 16-way B-load bank conflict
     int wr = wid >> 1, wc = wid & 1, g = lane >> 2, t = lane & 3;
     int br = blockIdx.x * 128, bc = blockIdx.y * 128, nk = k >> 5, ST_cols = n >> 6;  // n/64
+    size_t att = blockIdx.z;                      // batched mining: one independent attempt per z-slice
+    An += att*(size_t)m*k; Bn += att*(size_t)k*n; transcripts += att*(size_t)(m>>1)*(n>>6)*16;
     int acc[2][8][4];
     #pragma unroll
     for (int i = 0; i < 2; i++) for (int j = 0; j < 8; j++) for (int e = 0; e < 4; e++) acc[i][j][e] = 0;
@@ -453,6 +455,29 @@ int prl_mine2_bench(int m,int k,int n,int iters,double* out_ms){
     CK(cudaMalloc(&dAn,(size_t)m*k));CK(cudaMalloc(&dBn,(size_t)k*n));CK(cudaMalloc(&dTr,ST*16*4));
     CK(cudaMemset(dAn,1,(size_t)m*k));CK(cudaMemset(dBn,1,(size_t)k*n));CK(cudaMemset(dTr,0,ST*16*4));
     dim3 grid(m/128,n/128);
+    k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n); CK(cudaDeviceSynchronize());
+    cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e); cudaEventRecord(s);
+    for(int i=0;i<iters;i++) k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
+    cudaEventRecord(e); CK(cudaEventSynchronize(e));
+    float ms=0; cudaEventElapsedTime(&ms,s,e); *out_ms=(double)ms/iters;
+    cudaEventDestroy(s);cudaEventDestroy(e); cudaFree(dAn);cudaFree(dBn);cudaFree(dTr); return 0;
+}
+
+// Batched mining throughput at the REAL per-attempt shape. A single 128x256x256 attempt is
+// only grid (1,2) = 2 blocks (~2.4% of the GPU), so the mining-relevant metric is attempts/sec:
+// launch NATT independent attempts at once (grid.z=natt) to fill the SMs. Each z-slice has its
+// own An/Bn/transcripts (the kernel offsets by blockIdx.z). Dummy data — this times the noised
+// GEMM + 2x64 transcript hot loop only (noise gen is a separate, already-measured stage).
+int prl_mine2_bench_batched(int m,int k,int n,int natt,int iters,double* out_ms){
+    if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need mod128"); return 2; }
+    if(natt<1) natt=1;
+    size_t ST=(size_t)(m/2)*(n/64);
+    int8_t *dAn,*dBn; uint32_t* dTr;
+    CK(cudaMalloc(&dAn,(size_t)natt*m*k));CK(cudaMalloc(&dBn,(size_t)natt*k*n));
+    CK(cudaMalloc(&dTr,(size_t)natt*ST*16*4));
+    CK(cudaMemset(dAn,1,(size_t)natt*m*k));CK(cudaMemset(dBn,1,(size_t)natt*k*n));
+    CK(cudaMemset(dTr,0,(size_t)natt*ST*16*4));
+    dim3 grid(m/128,n/128,natt);
     k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n); CK(cudaDeviceSynchronize());
     cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e); cudaEventRecord(s);
     for(int i=0;i<iters;i++) k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
