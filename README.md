@@ -5,8 +5,7 @@ goal is simple: build the best open, auditable PRL miner for a 3090, mine true-s
 Pearl gateway, and keep every performance claim tied to source, tests, or live-node results.
 
 The project is grounded in the official
-[`pearl-research-labs/pearl`](https://github.com/pearl-research-labs/pearl) protocol. It does **not**
-reverse engineer, decompile, or copy AlphaMiner or any private binary.
+[`pearl-research-labs/pearl`](https://github.com/pearl-research-labs/pearl) protocol. 
 
 > **Current status:** the miner has a protocol-valid Ampere tensor-core hot loop and has driven a real
 > accepted SimNet block through the official Pearl gateway. The active fast path is `k_mine2` /
