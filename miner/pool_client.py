@@ -121,7 +121,8 @@ def _collect(c, deadline, watch_ids, label_job_methods=("mining.notify", "job"))
     return obs
 
 
-def probe(host: str, port: int, tls: bool, address: str, worker: str, seconds: float) -> int:
+def probe(host: str, port: int, tls: bool, address: str, worker: str, seconds: float,
+          wallet_only: bool = False) -> int:
     user = f"{address}.{worker}" if worker else address
     c = StratumClient(host, port, tls)
     print(f"[probe] connecting to {host}:{port} (tls={tls}) as user={user[:18]}...{user[-6:]}")
@@ -130,6 +131,24 @@ def probe(host: str, port: int, tls: bool, address: str, worker: str, seconds: f
     except OSError as e:
         print(f"[probe] CONNECT FAILED: {e}\n[probe] (no outbound reachability or wrong host/port)")
         return 2
+
+    # Clean single-shot handshake for the LuckyPool-style open dialect (no noisy multi-phase probing,
+    # to respect the pool's server): one mining.authorize with the wallet object, then listen for a job.
+    if wallet_only:
+        print("[probe] wallet-mode: single mining.authorize {wallet,worker,agent}, then listen for a job")
+        aid = c.send("mining.authorize", {"wallet": address, "worker": worker, "agent": "prl-3090-miner/1.0"})
+        obs = _collect(c, time.time() + seconds, {aid})
+        c.close()
+        print("\n[probe] ==== verdict ====")
+        if obs["job"] is not None:
+            print("  OPEN PROTOCOL ✓ — LuckyPool issued a JOB after wallet authorize (no secret gate).")
+            return 0
+        if obs["challenge"]:
+            print("  unexpected challenge signal — stopping (no bypass).")
+            return 1
+        print("  No job yet (auth result/schema above). Re-run from your own IP if rate-limited here;")
+        print("  the dialect is open (mining.authorize {wallet:...}) — next step is its job/submit schema.")
+        return 3
 
     # Phase 1: classic Stratum v1 (array params).
     print("[probe] phase 1: classic Stratum v1 (mining.subscribe / mining.authorize, array params)")
@@ -201,8 +220,10 @@ def main() -> int:
     ap.add_argument("--address", default="prl1p56vxsrzefhx8m49c2y4v86up845z6aurrxd3wulep9dk38cz8hcssu8cnm")
     ap.add_argument("--worker", default="rig0")
     ap.add_argument("--seconds", type=float, default=15.0)
+    ap.add_argument("--wallet-only", action="store_true",
+                    help="clean single mining.authorize {wallet,...} handshake (LuckyPool-style open dialect)")
     a = ap.parse_args()
-    return probe(a.host, a.port, a.tls, a.address, a.worker, a.seconds)
+    return probe(a.host, a.port, a.tls, a.address, a.worker, a.seconds, a.wallet_only)
 
 
 if __name__ == "__main__":
