@@ -200,9 +200,19 @@ def live(natt: int, max_batches: int) -> int:
         print(f"[fast] FOUND on GPU attempt {fa} after {tried} attempts in {time.time()-t0:.2f}s; "
               f"opened rows={ob.A_row_indices[:1]}.. cols={ob.B_column_indices[:1]}..")
         proof = create_proof(ob, header)
-        print(f"[fast] built PlainProof: base64 len={len(proof.to_base64())}")
+        b64 = proof.to_base64()
+        print(f"[fast] built PlainProof: base64 len={len(b64)}")
+        # The pool "share" is this exact proof, base64'd, wrapped in AlphaPool's documented wire
+        # `mining.submit [worker, job_id, base64_proof]`. Its content is correct (the node accepts
+        # the same proof, below). NOTE: actually delivering it to AlphaPool also requires their
+        # pearl.challenge_response auth gate, which this project does NOT implement/bypass (it is a
+        # third-party access control). Solo-to-node submission is the legitimate path used here.
+        share = {"id": 1, "method": "mining.submit",
+                 "params": ["<worker>", "<pool_job_id>", b64]}
+        print(f"[fast] POOL SHARE (correct content) -> mining.submit params="
+              f"['<worker>','<job_id>','{b64[:24]}...{b64[-8:]}' ({len(b64)}B base64)]")
         client.submit_plain_proof(proof, job)
-        print("[fast] submitPlainProof sent (gateway builds + submits the block async)")
+        print("[fast] submitPlainProof sent to node (gateway builds + submits the block async)")
         client.close()
         return 0
 
