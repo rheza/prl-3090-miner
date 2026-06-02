@@ -93,9 +93,15 @@ already validates).
     winning (attempt, tile)). **Cross-checked against the already-verified single `prl_mine2_run`**
     on an 8-attempt batch: the batched winner/tile/transcript match the single path (`batch_vs_single`
     PASS). This is the fast, protocol-valid path a real miner drives with a batch of nonces.
-  - ⬜ (c2) Python loop: per-nonce commitment→seeds, call `prl_mine2_batch_run`, on a hit reuse the
-    VERIFIED `simnet_solo.py` proof+submit path → accepted block driven by the GPU kernel.
-  - ⬜ (d) measure sustained accepted-block rate + watts end-to-end (noise gen included).
+  - 🟧 (c2) **DONE (code + offline proof)** — `miner/fast_mine.py`: GPU does the batched *search*
+    (`prl_mine2_search` over pre-noised attempts), the official `miner_base` builds the real
+    `PlainProof` for the single winner and submits it (the exact verified `simnet_solo.py` tail).
+    **Offline self-test PASSES**: GPU search over 64 attempts → a winner the **official torch
+    NoisyGemm independently confirms** (found + identical opened 2×64 tile) → "submission-grade".
+    Live loop + bring-up: `scripts/run_fast_mine.sh` (reuses the verified harness; only the miner
+    changes). `--selftest` needs no node.
+  - ⬜ (d) measure sustained accepted-block rate + watts end-to-end (noise gen included); run the
+    live loop to land a GPU-driven accepted block (harness already verified for the slow path).
 
 ## Performance targets (PRD §12.4) — correctness done; speed is the open work
 Minimum 20 TH/s · Beta 50 TH/s · Competitive 80 TH/s · Close-to-the-bone 100–110 TH/s. The naive

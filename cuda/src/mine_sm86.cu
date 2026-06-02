@@ -529,6 +529,42 @@ int prl_mine2_batch_run(const int8_t* A,const int8_t* B,
     return 0;
 }
 
+// Batched search over PRE-NOISED attempts: caller supplies [natt] stacked An/Bn (already noised,
+// exactly as the GPU GEMM consumes them) + per-attempt pow keys. GPU does the fast 2x64 GEMM+hash
+// + scan and returns the lowest-index winning (attempt, tile). Lets the Python miner keep full
+// control of the A,B/commitment/nonce semantics (and reuse the verified official proof path for
+// the single winner) while the GPU does the bulk search. Same kernels as the verified batch path.
+int prl_mine2_search(const int8_t* An,const int8_t* Bn,int m,int k,int n,int natt,
+                     const uint8_t* keys,const uint8_t* target32,
+                     int* found_attempt,int* a_row,int* b_col,uint32_t* tr_out){
+    const int r=128,TH=2,TW=64;
+    if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need mod128"); return 2; }
+    if(natt<1) natt=1;
+    size_t ST=(size_t)(m/TH)*(n/TW);
+    int8_t *dAn,*dBn; uint32_t *dTr,*dKeys,*dTgt,*dTrOut; int *dAR,*dBC,*dBest,*dFAtt;
+    CK(cudaMalloc(&dAn,(size_t)natt*m*k));CK(cudaMalloc(&dBn,(size_t)natt*k*n));
+    CK(cudaMalloc(&dTr,(size_t)natt*ST*16*4));CK(cudaMemset(dTr,0,(size_t)natt*ST*16*4));
+    CK(cudaMalloc(&dKeys,(size_t)natt*32));CK(cudaMalloc(&dTgt,32));CK(cudaMalloc(&dTrOut,64));
+    CK(cudaMalloc(&dAR,4));CK(cudaMalloc(&dBC,4));CK(cudaMalloc(&dBest,4));CK(cudaMalloc(&dFAtt,4));
+    CK(cudaMemcpy(dAn,An,(size_t)natt*m*k,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dBn,Bn,(size_t)natt*k*n,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dKeys,keys,(size_t)natt*32,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dTgt,target32,32,cudaMemcpyHostToDevice));
+    int T=256; dim3 grid(m/128,n/128,natt);
+    k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
+    CK(cudaMemset(dBest,0x7f,4));
+    long long total=(long long)natt*ST; int blocks=(int)((total+T-1)/T);
+    k_pow_scan_find_batched<<<blocks,T>>>(dTr,dKeys,dTgt,m,n,r,TH,TW,natt,dBest);
+    k_pow_scan_emit_batched<<<1,1>>>(dTr,m,n,r,TH,TW,natt,dBest,dFAtt,dAR,dBC,dTrOut);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(found_attempt,dFAtt,4,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(a_row,dAR,4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(b_col,dBC,4,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(tr_out,dTrOut,64,cudaMemcpyDeviceToHost));
+    cudaFree(dAn);cudaFree(dBn);cudaFree(dTr);cudaFree(dKeys);cudaFree(dTgt);cudaFree(dTrOut);
+    cudaFree(dAR);cudaFree(dBC);cudaFree(dBest);cudaFree(dFAtt);
+    return 0;
+}
+
 int prl_mine2_bench(int m,int k,int n,int iters,double* out_ms){
     if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need mod128"); return 2; }
     int8_t *dAn,*dBn; uint32_t* dTr; size_t ST=(size_t)(m/2)*(n/64);
