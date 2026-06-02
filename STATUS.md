@@ -114,6 +114,20 @@ already validates).
     `generate_noise_metrices` in Python — the old 68 % cost) at ~tens of attempts/s; the GPU *search*
     itself sustains ~4.3–4.9 M attempts/s (bench). Wiring `prl_noisegen` (GPU noise-from-seeds, already
     bit-exact) into the batch loop is the remaining step to make the **live** rate GPU-bound.
+  - ✅ (b6) **A operand via `ldmatrix.x4.shared.b16`** — golden-verified (the `.shared` state-space
+    qualifier is required; without it the `cvta`'d shared offset is read as generic → illegal access).
+    Throughput change is within run-to-run noise: A is only 8 loads/lane (vs B's 16) so it was never the
+    bottleneck. **Plateau reached with the safe wins: ~95 TOPS sustained** (noisy ~85–96 from WSL/consumer
+    clock instability — 1980 MHz vs the 2115 MHz rating, GPU at ~200 W/46 °C so *not* power/thermal capped;
+    ~101–103 at rated boost). **MFU ≈ 34 %.** The remaining lever to ~50 % MFU (→ ~120–130 TOPS) is
+    eliminating the software B-transpose via the int8 **"crosswise" smem layout + `ldmatrix`** (the CUTLASS
+    approach) — genuine multi-day work with silent-correctness risk; `ldmatrix.trans` cannot do it on
+    Ampere because it transposes at 16-bit granularity, scrambling int8 k-pairs.
+  - **Pool auth — settled by source:** grepping the official Pearl repo, every `challenge` match is
+    Plonky2/STARK Fiat-Shamir or unrelated — there is **no `pearl.challenge`/`challenge_response` in
+    Pearl's open protocol**. AlphaPool's gate is **proprietary/undocumented**, obtainable only by
+    reverse-engineering the closed AlphaMiner — which this project does not do. Shares are correct;
+    legitimate delivery is solo-to-`pearld` (works) or a pool that publishes its auth.
 
 ## Performance targets (PRD §12.4) — assessment
 Minimum 20 · Beta 50 · Competitive 80 · Close-to-the-bone 100–110 TH/s.
