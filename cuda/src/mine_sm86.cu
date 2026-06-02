@@ -343,12 +343,17 @@ __global__ void __launch_bounds__(256, 3) k_mine2(const int8_t* An, const int8_t
         for (int ncol = 0; ncol < 8; ncol++) { int bcol = wc*64 + ncol*8 + g;
             bf0[ncol] = *(const uint32_t*)&Bb[bcol*36 + t*4];
             bf1[ncol] = *(const uint32_t*)&Bb[bcol*36 + t*4 + 16]; }
+        // A operand via ldmatrix.x4.b16: As is k-contiguous row-major, the natural layout. lanes
+        // 0-15 address matrices 0/1 (k0-15 of rows arow+0..15), lanes 16-31 -> matrices 2/3 (k16-31);
+        // ldmatrix redistributes so {a0,a1,a2,a3} == the m16n8k32 A fragment exactly.
+        int alo = (lane < 16) ? lane : (lane - 16), akoff = (lane < 16) ? 0 : 16;
         #pragma unroll
         for (int mrow = 0; mrow < 2; mrow++) {
             int arow = wr*32 + mrow*16;
-            const int8_t* Ar0 = &As[cur][(arow+g)*32]; const int8_t* Ar8 = &As[cur][(arow+g+8)*32];
-            uint32_t a0 = *(const uint32_t*)(Ar0+t*4), a1 = *(const uint32_t*)(Ar8+t*4);
-            uint32_t a2 = *(const uint32_t*)(Ar0+t*4+16), a3 = *(const uint32_t*)(Ar8+t*4+16);
+            unsigned aptr = (unsigned)__cvta_generic_to_shared(&As[cur][(arow+alo)*32 + akoff]);
+            uint32_t a0, a1, a2, a3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+              : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(aptr));
             #pragma unroll
             for (int ncol = 0; ncol < 8; ncol++) { int* c = acc[mrow][ncol];
                 asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
