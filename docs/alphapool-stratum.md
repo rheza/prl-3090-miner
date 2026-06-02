@@ -6,18 +6,22 @@ decompiled, disassembled, patched, or copied.
 
 ## Current conclusion
 
-The socket protocol is now mapped well enough to implement the submit path, but this miner cannot submit
-valid AlphaPool shares yet.
+The socket protocol is mapped well enough to know the submit shape, and the proof content path is now
+proven on the official Pearl side: `fast_mine.py` can hand a GPU-found winner to the official
+`PlainProof` builder and get a live `pearld` node to accept the resulting block through
+`submitPlainProof`.
 
-Two blockers remain:
+AlphaPool submission is still not available because the connection is blocked before
+`mining.authorize` by AlphaPool's undocumented `pearl.challenge_response` handshake. This project does
+not reverse engineer private binaries or bypass that gate. Once an authorized/public challenge solver is
+available, the submit envelope is:
 
-1. AlphaPool requires an undocumented `pearl.challenge_response` before `mining.authorize`.
-2. The current `cuda-mine` backend still returns small `"_harness": true` JSON proof bytes. AlphaPool
-   expects a base64 Pearl proof payload around 276,288 bytes raw / 368,384 bytes base64 for the
-   observed job shape.
+```json
+{"id": 5, "method": "mining.submit", "params": ["prl1p...worker", "<job_id>", "<base64_plain_proof>"]}
+```
 
-Do not point the current harness proof output at AlphaPool and interpret rejects as a speed result. It is
-not a valid share payload.
+Do not interpret current AlphaPool probe failures as proof rejects. The client has not reached
+authorization or submitted a share.
 
 ## Observed handshake
 
@@ -111,16 +115,17 @@ Expected current result against AlphaPool is `alphapool_challenge_solver_missing
 connection is reachable, but this open miner cannot pass AlphaPool auth until the challenge algorithm is
 publicly specified or independently reimplemented without private-binary reverse engineering.
 
+Latest verified probe in this repo on 2026-06-02, using the provided public payout address and
+`x;d=32768`, reached `pearl.challenge` (`difficulty=32`) and stopped before authorization. No share was
+submitted.
+
 ## Implementation path
 
 To make `prl3090-miner` submit real AlphaPool shares:
 
-1. Implement the `pearl.challenge_response` solver from a public specification or clean independent
-   implementation.
-2. Replace harness proof bytes with real `PlainProof` bytes:
-   - generate or ingest full-size A/B tensors for the pool mining parameters,
-   - produce Merkle roots/proofs for the opened rows/columns,
-   - serialize through `py-pearl-mining` compatible `PlainProof` bytes/base64.
-3. Add an AlphaPool mode that maps `pearl.set_mining_params` / `mining.notify` into GPU work, submits
+1. Implement the `pearl.challenge_response` solver from a public specification, an operator-provided
+   authorization path, or another legitimate source that does not require bypassing AlphaPool access
+   control.
+2. Add an AlphaPool mode that maps `pearl.set_mining_params` / `mining.notify` into GPU work, submits
    `mining.submit`, and tracks accepted/rejected/stale shares for protocol TH/s.
-4. Run at least 1 hour on the same pool region/static difficulty before comparing to AlphaMiner.
+3. Run at least 1 hour on the same pool region/static difficulty before comparing to AlphaMiner.
