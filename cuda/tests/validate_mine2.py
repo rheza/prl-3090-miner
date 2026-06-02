@@ -115,9 +115,9 @@ def main() -> int:
     # of the GPU), so throughput == batched attempts/sec. Sweep NATT to find where the GPU fills.
     m, k, n = 128, 256, 256
     print(f"BATCHED MINING THROUGHPUT (real per-attempt shape {m}x{k}x{n}, noised GEMM + 2x64 hash):")
-    for natt in [1, 16, 64, 128, 256, 512, 1024]:
+    for natt in [256, 512, 1024, 2048, 4096]:
         ms = ctypes.c_double(0)
-        if lib.prl_mine2_bench_batched(m, k, n, natt, 50, ctypes.byref(ms)) == 0:
+        if lib.prl_mine2_bench_batched(m, k, n, natt, 100, ctypes.byref(ms)) == 0:
             aps = natt / (ms.value / 1e3)
             tops = 2.0 * natt * m * k * n / (ms.value / 1e3) / 1e12
             print(f"  natt={natt:5d}: {ms.value:.4f} ms/iter  {aps/1e6:7.3f} M attempts/s  ({tops:6.2f} TOPS)")

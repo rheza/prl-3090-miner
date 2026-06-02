@@ -309,11 +309,12 @@ __global__ void k_transpose(const int8_t* U, int8_t* T, int rows, int cols) {  /
 // (no SMEM materialize) — derived from the verified m16n8k32 fragment layout, so it stays
 // bit-exact vs the official NoisyGemm / tests/golden_protocol while dropping the 64 KB
 // dynamic SMEM that capped occupancy at 1 block/SM.
-__global__ void k_mine2(const int8_t* An, const int8_t* Bn, uint32_t* transcripts,
-                        int m, int k, int n) {
+__global__ void __launch_bounds__(256, 3) k_mine2(const int8_t* An, const int8_t* Bn,
+                        uint32_t* transcripts, int m, int k, int n) {
     __shared__ int8_t As[2][128 * 32];
-    __shared__ int8_t Bs[2][32 * 144];   // n stride 144B (16-aligned, not a 32-word multiple) ->
-    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;   // breaks the 16-way B-load bank conflict
+    __shared__ int8_t Bs[2][32 * 128];    // cp.async landing (n-contiguous, as in global)
+    __shared__ int8_t Bst[2][128 * 36];   // B transposed to k-contiguous (stride 36) -> the B fragment
+    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;   // is one conflict-free uint32 load
     int wr = wid >> 1, wc = wid & 1, g = lane >> 2, t = lane & 3;
     int br = blockIdx.x * 128, bc = blockIdx.y * 128, nk = k >> 5, ST_cols = n >> 6;  // n/64
     size_t att = blockIdx.z;                      // batched mining: one independent attempt per z-slice
@@ -324,18 +325,24 @@ __global__ void k_mine2(const int8_t* An, const int8_t* Bn, uint32_t* transcript
 #define LOAD2(s, koff) do { int ar = tid >> 1, ah = tid & 1; \
         cp_async16(&As[s][ar*32 + ah*16], &An[IDX(br+ar, (koff)+ah*16, k)]); \
         int br_ = tid >> 3, bp = tid & 7; \
-        cp_async16(&Bs[s][br_*144 + bp*16], &Bn[IDX((koff)+br_, bc+bp*16, n)]); } while (0)
+        cp_async16(&Bs[s][br_*128 + bp*16], &Bn[IDX((koff)+br_, bc+bp*16, n)]); } while (0)
     LOAD2(0, 0); cp_commit();
     for (int ks = 0; ks < nk; ks++) {
         int cur = ks & 1;
         if (ks + 1 < nk) { LOAD2((ks + 1) & 1, (ks + 1) * 32); cp_commit(); cp_wait1(); } else cp_wait0();
         __syncthreads();
-        const int8_t* Bb = &Bs[cur][0];
+        // transpose this 32-row K-chunk of B (n-contig -> k-contig, stride 36) so each B fragment is
+        // one conflict-free uint32 load. The extra sync is hidden by 3 blocks/SM + the batched grid.
+        #pragma unroll
+        for (int i = 0; i < 16; i++) { int idx = tid + i*256, kk = idx >> 7, nn = idx & 127;
+            Bst[cur][nn*36 + kk] = Bs[cur][kk*128 + nn]; }
+        __syncthreads();
+        const int8_t* Bb = &Bst[cur][0];
         uint32_t bf0[8], bf1[8];
         #pragma unroll
         for (int ncol = 0; ncol < 8; ncol++) { int bcol = wc*64 + ncol*8 + g;
-            bf0[ncol] = pk(Bb[(t*4+0)*144+bcol], Bb[(t*4+1)*144+bcol], Bb[(t*4+2)*144+bcol], Bb[(t*4+3)*144+bcol]);
-            bf1[ncol] = pk(Bb[(t*4+16)*144+bcol], Bb[(t*4+17)*144+bcol], Bb[(t*4+18)*144+bcol], Bb[(t*4+19)*144+bcol]); }
+            bf0[ncol] = *(const uint32_t*)&Bb[bcol*36 + t*4];
+            bf1[ncol] = *(const uint32_t*)&Bb[bcol*36 + t*4 + 16]; }
         #pragma unroll
         for (int mrow = 0; mrow < 2; mrow++) {
             int arow = wr*32 + mrow*16;
@@ -594,7 +601,8 @@ int prl_mine2_bench_batched(int m,int k,int n,int natt,int iters,double* out_ms)
     CK(cudaMemset(dAn,1,(size_t)natt*m*k));CK(cudaMemset(dBn,1,(size_t)natt*k*n));
     CK(cudaMemset(dTr,0,(size_t)natt*ST*16*4));
     dim3 grid(m/128,n/128,natt);
-    k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n); CK(cudaDeviceSynchronize());
+    for(int w=0;w<128;w++) k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n);   // sustained warmup -> GPU boost clock
+    CK(cudaDeviceSynchronize());
     cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e); cudaEventRecord(s);
     for(int i=0;i<iters;i++) k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
     cudaEventRecord(e); CK(cudaEventSynchronize(e));
