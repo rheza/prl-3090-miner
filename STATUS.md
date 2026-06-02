@@ -45,6 +45,23 @@ native on Ampere) but is a **multi-week CUDA effort**; its #1 risk is the accumu
 re-derivation (a silent-correctness hazard, now gated by the golden transcript words the naive backend
 already validates).
 
+## Reality check on "100×" and protocol-valid speed (2026-06)
+- **"100× faster" is physically impossible.** `k_mine` is ~44 TOPS; 100× = 4400 TOPS ≈ **15× the RTX 3090's
+  ~284 TOPS int8 hardware ceiling**. Realistic kernel headroom is **~3–4× (→ ~150–200 TOPS)** via
+  `ldmatrix`+swizzle; the end-to-end attempt rate has more room (it is overhead-bound) but is capped by
+  that kernel ceiling. No fabricated TH/s will be reported.
+- **The fast GPU kernel is not protocol-valid yet.** `k_mine`/golden hardcode a **16×16** hash tile, but
+  the real production config is **hash_tile 2×64** (rows_pattern `[0,8]`, 64-entry cols_pattern, rank 128,
+  matmul tile 128×256) — confirmed from `GPUMatmulConfigFactory`. The CPU `simnet_solo.py` is
+  protocol-valid (it uses the real config; its block was accepted); the GPU kernel must be re-aligned to
+  2×64 before it can produce valid proofs.
+- **Protocol oracle ready:** `reference/generate_protocol_golden.py` regenerates golden at the real 2×64
+  config and **cross-checks the NumPy reference against the official torch NoisyGemm — they match**
+  (`tests/golden_protocol/`). This is the correctness target for the GPU rework.
+- **Remaining real plan (multi-step, golden-gated, honest numbers only):** (a) rework `k_mine` inner-hash/
+  transcript to 2×64 + validate vs `tests/golden_protocol/`; (b) `ldmatrix`+swizzle optimize (~3–4×);
+  (c) wire GPU-search → `create_proof` → submit; (d) measure sustained accepted-block rate + watts.
+
 ## Performance targets (PRD §12.4) — correctness done; speed is the open work
 Minimum 20 TH/s · Beta 50 TH/s · Competitive 80 TH/s · Close-to-the-bone 100–110 TH/s. The naive
 (correct, non-tensor-core) backend measures **~2.9 GMAC/s** on the production shape — ~4–5 orders of
