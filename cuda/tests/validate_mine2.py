@@ -59,6 +59,49 @@ def main() -> int:
         print(f"  [{'PASS' if good else 'FAIL'}] {case['name']:18s} found={'=' if of else 'X'} "
               f"loc={'=' if ol else 'X'} transcript={'=' if otr else 'X'}")
 
+    # ---- batched fast path: cross-check prl_mine2_batch_run vs the verified single path ----
+    sys.path.insert(0, str(ROOT / "reference"))
+    import pearl_reference as ref  # noqa: E402
+    lib.prl_mine2_batch_run.argtypes = [i8p]*6 + [ctypes.c_int]*4 + [u8p, u8p, ip, ip, ip, u32p]
+    lib.prl_mine2_batch_run.restype = ctypes.c_int
+    pf = next(c for c in json.loads((GOLDEN / "manifest.json").read_text())["cases"] if c["name"] == "p_found")
+    d = np.load(GOLDEN / pf["file"]); m, k, n, R = pf["m"], pf["k"], pf["n"], pf["noise_rank"]
+    Aa, pA = p8(d["A"]); Bb, pB = p8(d["B"])
+    tgt = np.frombuffer(int(pf["pow_target"], 16).to_bytes(32, "little"), np.uint8).copy()
+    natt = 8
+    kA = [f"batchKeyA_{j:02d}".encode().ljust(32, b"\0")[:32] for j in range(natt)]
+    kB = [f"batchKeyB_{j:02d}".encode().ljust(32, b"\0")[:32] for j in range(natt)]
+    nz = [ref.NoiseGenerator(noise_rank=R).generate(kA[j], kB[j], m, k, n) for j in range(natt)]
+
+    exp_att, exp_loc, exp_tr, hold = -1, None, None, []          # first winner per the single path
+    for j in range(natt):
+        ps = []
+        for arr in nz[j]:
+            a, p = p8(arr); hold.append(a); ps.append(p)
+        kj = np.frombuffer(kA[j], np.uint8).copy()
+        f0 = ctypes.c_int(0); r0 = ctypes.c_int(0); c0 = ctypes.c_int(0); t0 = np.zeros(16, np.uint32)
+        lib.prl_mine2_run(pA, pB, ps[0], ps[1], ps[2], ps[3], m, k, n,
+                          kj.ctypes.data_as(u8p), tgt.ctypes.data_as(u8p),
+                          ctypes.byref(f0), ctypes.byref(r0), ctypes.byref(c0), t0.ctypes.data_as(u32p))
+        if f0.value and exp_att < 0:
+            exp_att, exp_loc, exp_tr = j, (r0.value, c0.value), [int(w) for w in t0]
+
+    EAL = np.ascontiguousarray(np.stack([nz[j][0] for j in range(natt)]), np.int8)
+    EAR = np.ascontiguousarray(np.stack([nz[j][1] for j in range(natt)]), np.int8)
+    EBL = np.ascontiguousarray(np.stack([nz[j][2] for j in range(natt)]), np.int8)
+    EBR = np.ascontiguousarray(np.stack([nz[j][3] for j in range(natt)]), np.int8)
+    keys = np.frombuffer(b"".join(kA), np.uint8).copy()
+    fa = ctypes.c_int(0); ar = ctypes.c_int(0); bc = ctypes.c_int(0); tr = np.zeros(16, np.uint32)
+    rc = lib.prl_mine2_batch_run(pA, pB, EAL.ctypes.data_as(i8p), EAR.ctypes.data_as(i8p),
+                                 EBL.ctypes.data_as(i8p), EBR.ctypes.data_as(i8p), m, k, n, natt,
+                                 keys.ctypes.data_as(u8p), tgt.ctypes.data_as(u8p),
+                                 ctypes.byref(fa), ctypes.byref(ar), ctypes.byref(bc), tr.ctypes.data_as(u32p))
+    loc_ok = exp_att < 0 or ((ar.value, bc.value) == exp_loc and [int(w) for w in tr] == exp_tr)
+    bg = (rc == 0 and fa.value == exp_att and loc_ok)
+    ok = ok and bg
+    print(f"  [{'PASS' if bg else 'FAIL'}] batch_vs_single   natt={natt} winner_attempt={fa.value} "
+          f"(single={exp_att}) loc/transcript={'=' if loc_ok else 'X'}")
+
     print("THROUGHPUT (k_mine2, 2x64 protocol kernel, kernel-only):")
     for (m, k, n) in [(128, 256, 256), (1024, 1024, 1024), (2048, 2048, 2048)]:
         ms = ctypes.c_double(0)

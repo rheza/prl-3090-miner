@@ -85,9 +85,16 @@ already validates).
     blocks ≈ 2.4 % of the 82-SM GPU**, so a single attempt can never be fast (measured **1.2 TOPS**).
     Added `blockIdx.z` batching to `k_mine2` (one independent attempt per z-slice; a no-op for the
     single-attempt golden path, still bit-exact) + `prl_mine2_bench_batched`. Filling the GPU with
-    NATT concurrent attempts: **peak ~72.9 TOPS / ~4.35 M noised-GEMM+hash attempts/s at NATT=256**
-    (vs 0.073 M/s at NATT=1 — a ~60× fill factor). Sweep in `cuda/tests/validate_mine2.py`.
-  - ⬜ (c) wire batched GPU `k_mine2` → per-attempt GPU noise → `create_proof` → submit (fast + valid).
+    NATT concurrent attempts: **peak ~74–82 TOPS / ~4.3–4.9 M noised-GEMM+hash attempts/s** (NATT
+    256–512; vs 0.06 M/s at NATT=1 — a ~70× fill factor). Sweep in `cuda/tests/validate_mine2.py`.
+  - 🟧 (c1) **DONE (GPU side) — batched fast-path mining core.** `prl_mine2_batch_run` (shared base
+    A,B + per-attempt stacked noise + per-attempt 32-byte pow keys → per-attempt GPU noise →
+    batched `k_mine2` → batched keyed-BLAKE3 scan `k_pow_scan_find/emit_batched` → lowest-index
+    winning (attempt, tile)). **Cross-checked against the already-verified single `prl_mine2_run`**
+    on an 8-attempt batch: the batched winner/tile/transcript match the single path (`batch_vs_single`
+    PASS). This is the fast, protocol-valid path a real miner drives with a batch of nonces.
+  - ⬜ (c2) Python loop: per-nonce commitment→seeds, call `prl_mine2_batch_run`, on a hit reuse the
+    VERIFIED `simnet_solo.py` proof+submit path → accepted block driven by the GPU kernel.
   - ⬜ (d) measure sustained accepted-block rate + watts end-to-end (noise gen included).
 
 ## Performance targets (PRD §12.4) — correctness done; speed is the open work

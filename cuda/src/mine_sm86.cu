@@ -218,6 +218,39 @@ __global__ void k_pow_scan_emit_batch(const uint32_t* transcripts, int m, int n,
     for (int x = 0; x < 16; x++) tr_out[x] = tr[x];
 }
 
+// Batched PoW scan: one thread per (attempt, tile) across all natt attempts, each keyed with
+// its own per-attempt pow key (noise_seed_A). best = min gid (= att*per + tile) that wins, so
+// the lowest attempt index / tile is reported deterministically.
+__global__ void k_pow_scan_find_batched(const uint32_t* transcripts, const uint32_t* keys,
+                                        const uint32_t* target, int m, int n, int r, int th,
+                                        int tw, int natt, int* best) {
+    int ST_cols = n / tw, TI = m / r, TJ = n / r, SH = r / th, SW = r / tw;
+    int per = TI * TJ * SH * SW;                       // == (m/th)*(n/tw) tiles per attempt
+    long long total = (long long)natt * per;
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    int att = (int)(gid / per), idx = (int)(gid % per), sr, sc;
+    pow_scan_index_to_tile(idx, TJ, SH, SW, &sr, &sc);
+    const uint32_t* tr = &transcripts[((size_t)att * per + (size_t)(sr * ST_cols + sc)) * 16];
+    uint32_t dig[8];
+    blake3_keyed_block(tr, &keys[att * 8], dig);
+    if (digest_le_target(dig, target)) atomicMin(best, (int)gid);
+}
+
+__global__ void k_pow_scan_emit_batched(const uint32_t* transcripts, int m, int n, int r, int th,
+                                        int tw, int natt, const int* best, int* found_att,
+                                        int* a_row, int* b_col, uint32_t* tr_out) {
+    if (threadIdx.x || blockIdx.x) return;
+    int ST_cols = n / tw, TI = m / r, TJ = n / r, SH = r / th, SW = r / tw;
+    int per = TI * TJ * SH * SW; long long total = (long long)natt * per; int g = *best;
+    if (g < 0 || (long long)g >= total) { *found_att = -1; *a_row = -1; *b_col = -1; return; }
+    int att = g / per, idx = g % per, sr, sc;
+    pow_scan_index_to_tile(idx, TJ, SH, SW, &sr, &sc);
+    const uint32_t* tr = &transcripts[((size_t)att * per + (size_t)(sr * ST_cols + sc)) * 16];
+    *found_att = att; *a_row = sr * th; *b_col = sc * tw;
+    for (int x = 0; x < 16; x++) tr_out[x] = tr[x];
+}
+
 // ---------- GPU noise generation (faithful to noise_generation.py) ----------
 // Removes the per-attempt Python BLAKE3 noise loop (the 68% bottleneck) by deriving
 // E_AL/E_AR/E_BL/E_BR on-device from the 32-byte keys, exactly as NoiseGenerator does.
@@ -446,6 +479,53 @@ int prl_mine2_run(const int8_t* A,const int8_t* B,const int8_t* EAL,const int8_t
     cudaFree(dA);cudaFree(dB);cudaFree(dEAL);cudaFree(dEAR);cudaFree(dEBL);cudaFree(dEBR);
     cudaFree(dAn);cudaFree(dBn);cudaFree(dTr);cudaFree(dKey);cudaFree(dTgt);cudaFree(dTrOut);
     cudaFree(dF);cudaFree(dAR);cudaFree(dBC);cudaFree(dBest);
+    return 0;
+}
+
+// PROTOCOL-VALID batched miner: shared base A,B + per-attempt noise (EAL/EAR/EBL/EBR are
+// [natt] stacked) + per-attempt 32-byte pow keys. Generates each attempt's noised An/Bn on
+// the GPU, runs the batched 2x64 GEMM+hash, scans all attempts, and emits the lowest-index
+// winning (attempt, tile). This is the fast path a real miner drives with a batch of nonces.
+int prl_mine2_batch_run(const int8_t* A,const int8_t* B,
+                        const int8_t* EAL,const int8_t* EAR,const int8_t* EBL,const int8_t* EBR,
+                        int m,int k,int n,int natt,
+                        const uint8_t* keys,const uint8_t* target32,
+                        int* found_attempt,int* a_row,int* b_col,uint32_t* tr_out){
+    const int r=128,TH=2,TW=64;
+    if(m%128||n%128||k%128){ snprintf(g_err,sizeof(g_err),"need mod128"); return 2; }
+    if(natt<1) natt=1;
+    size_t ST=(size_t)(m/TH)*(n/TW);
+    int8_t *dA,*dB,*dEAL,*dEAR,*dEBL,*dEBR,*dAn,*dBn;
+    uint32_t *dTr,*dKeys,*dTgt,*dTrOut; int *dAR,*dBC,*dBest,*dFAtt;
+    CK(cudaMalloc(&dA,(size_t)m*k));CK(cudaMalloc(&dB,(size_t)k*n));
+    CK(cudaMalloc(&dEAL,(size_t)natt*m*r));CK(cudaMalloc(&dEAR,(size_t)natt*r*k));
+    CK(cudaMalloc(&dEBL,(size_t)natt*k*r));CK(cudaMalloc(&dEBR,(size_t)natt*r*n));
+    CK(cudaMalloc(&dAn,(size_t)natt*m*k));CK(cudaMalloc(&dBn,(size_t)natt*k*n));
+    CK(cudaMalloc(&dTr,(size_t)natt*ST*16*4));CK(cudaMemset(dTr,0,(size_t)natt*ST*16*4));
+    CK(cudaMalloc(&dKeys,(size_t)natt*32));CK(cudaMalloc(&dTgt,32));CK(cudaMalloc(&dTrOut,64));
+    CK(cudaMalloc(&dAR,4));CK(cudaMalloc(&dBC,4));CK(cudaMalloc(&dBest,4));CK(cudaMalloc(&dFAtt,4));
+    CK(cudaMemcpy(dA,A,(size_t)m*k,cudaMemcpyHostToDevice));CK(cudaMemcpy(dB,B,(size_t)k*n,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dEAL,EAL,(size_t)natt*m*r,cudaMemcpyHostToDevice));CK(cudaMemcpy(dEAR,EAR,(size_t)natt*r*k,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dEBL,EBL,(size_t)natt*k*r,cudaMemcpyHostToDevice));CK(cudaMemcpy(dEBR,EBR,(size_t)natt*r*n,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dKeys,keys,(size_t)natt*32,cudaMemcpyHostToDevice));CK(cudaMemcpy(dTgt,target32,32,cudaMemcpyHostToDevice));
+    int T=256;
+    for(int j=0;j<natt;j++){
+        k_noiseA<<<((size_t)m*k+T-1)/T,T>>>(dA,dEAL+(size_t)j*m*r,dEAR+(size_t)j*r*k,dAn+(size_t)j*m*k,m,k,r);
+        k_noiseB<<<((size_t)k*n+T-1)/T,T>>>(dB,dEBL+(size_t)j*k*r,dEBR+(size_t)j*r*n,dBn+(size_t)j*k*n,k,n,r);
+    }
+    dim3 grid(m/128,n/128,natt);
+    k_mine2<<<grid,256>>>(dAn,dBn,dTr,m,k,n);
+    CK(cudaMemset(dBest,0x7f,4));                       // 0x7f7f7f7f sentinel (> any real gid)
+    long long total=(long long)natt*ST; int blocks=(int)((total+T-1)/T);
+    k_pow_scan_find_batched<<<blocks,T>>>(dTr,dKeys,dTgt,m,n,r,TH,TW,natt,dBest);
+    k_pow_scan_emit_batched<<<1,1>>>(dTr,m,n,r,TH,TW,natt,dBest,dFAtt,dAR,dBC,dTrOut);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(found_attempt,dFAtt,4,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(a_row,dAR,4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(b_col,dBC,4,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(tr_out,dTrOut,64,cudaMemcpyDeviceToHost));
+    cudaFree(dA);cudaFree(dB);cudaFree(dEAL);cudaFree(dEAR);cudaFree(dEBL);cudaFree(dEBR);
+    cudaFree(dAn);cudaFree(dBn);cudaFree(dTr);cudaFree(dKeys);cudaFree(dTgt);cudaFree(dTrOut);
+    cudaFree(dAR);cudaFree(dBC);cudaFree(dBest);cudaFree(dFAtt);
     return 0;
 }
 
